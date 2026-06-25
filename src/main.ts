@@ -10,7 +10,7 @@ import {
   nearestPointOnGraph,
   terminalsConnected,
 } from './graph'
-import { boundsFromCenter, boundsFromPoints, boundsSpanMeters, bridgeCorridorHalfWidth, bridgeFetchBounds, corridorBoundsChunks, describeFetchRegionArea, fetchRegionFromPointSet, haversineMeters, isElongatedPointSet, isSimplePolygon, orderPointsAlongAxis, padBounds, pointSetSpanMeters, shouldPreferPatchBridgeLoad, unionBounds, asFetchRegion } from './geo'
+import { boundsFromCenter, boundsFromPoints, boundsSpanMeters, bridgeCorridorHalfWidth, bridgeFetchBounds, corridorBoundsChunks, describeFetchRegionArea, elongatedCorridorRegion, fetchRegionFromPointSet, haversineMeters, isElongatedPointSet, isSimplePolygon, orderPointsAlongAxis, padBounds, pointSetSpanMeters, snapCoverageLimitMeters, unionBounds, asFetchRegion } from './geo'
 import { solveChinesePostman } from './chinesePostman'
 import { fetchOsmGraph, profileCaveat } from './osm'
 import { createRenderController, routeSummary } from './render'
@@ -257,7 +257,8 @@ const pendingPointFinalizations: Array<{ id: string; location: LatLng }> = []
 let drainingPointFinalizations = false
 let graphLoadAbortRetries = 0
 let graphLoadFatalError = false
-let pointExpansionFlight: Promise<boolean | 'aborted'> | undefined
+let pointExpansionFlight: Promise<boolean | 'aborted' | 'deferred'> | undefined
+let progressiveRefreshFrame: number | undefined
 const graphLoadQueue = new GraphLoadQueue((event, data) => debugLog('queue', event, data))
 const MAX_GRAPH_LOAD_ABORT_RETRIES = 15
 const POINT_CLICK_COALESCE_MS = 250
@@ -269,6 +270,8 @@ const PATCH_EXTRA_MARGIN_METERS = 50
 const BRIDGE_MAX_ATTEMPTS = 5
 const BULK_LOAD_MAX_POINTS = 12
 const SNAP_RELOAD_DISTANCE_METERS = 120
+const TRAIL_MAX_PATCH_RADIUS_METERS = 900
+const ELONGATED_CORRIDOR_MAX_SPAN_METERS = 8_000
 
 const map = L.map('map', {
   doubleClickZoom: false,
@@ -317,6 +320,7 @@ type PointCoverageResult = {
   ok: boolean
   reloaded: boolean
   aborted?: boolean
+  deferred?: boolean
 }
 
 installHoldDragBox(map, async (bounds) => {
@@ -495,23 +499,26 @@ async function loadGraph(
       currentProfile(),
       { connectedOnly: !(options.internal || (options.merge && graph)) },
     )
+    let nextGraph = patch
     if (options.merge && graph) {
-      graph = mergeStreetGraphs(graph, patch)
-      lastBounds = lastBounds ? unionBounds(lastBounds, bounds) : bounds
-    } else {
-      graph = patch
-      if (!options.internal) lastBounds = bounds
+      nextGraph = mergeStreetGraphs(graph, patch)
     }
     if (polygonPoints.length >= 3 && selectedInputMode === 'polygon' && !options.merge) {
-      graph = clipGraphToPolygon(graph, polygonPoints)
+      nextGraph = clipGraphToPolygon(nextGraph, polygonPoints)
     }
     if (!graphLoadQueue.isCurrent(loadWork)) {
       debugLog('loadGraph', 'execute:stale-after-build', {
         workId: loadWork.id,
-        nodes: graph.nodes.length,
-        edges: graph.edges.length,
+        nodes: nextGraph.nodes.length,
+        edges: nextGraph.edges.length,
       })
       return false
+    }
+    graph = nextGraph
+    if (options.merge) {
+      lastBounds = lastBounds ? unionBounds(lastBounds, bounds) : bounds
+    } else if (!options.internal) {
+      lastBounds = bounds
     }
     if (!options.preserveSelectedPoints) {
       selectedPoints = []
@@ -519,17 +526,19 @@ async function loadGraph(
         renderer.setPoints(selectedPoints)
       }
     }
-    if (!options.deferUi) {
+    if (options.deferUi) {
+      scheduleProgressiveGraphDisplay()
+    } else {
       renderer.setGraph(graph)
       route = undefined
       renderer.setRoute(undefined)
       updateUrl()
       updateOperationEstimates()
+      updateStats({ vertices: graph.nodes.length, edges: graph.edges.length })
     }
     if (!options.preserveSelectedPoints) {
       for (const point of restorePointLocations) addPoint(point, false)
     }
-    updateStats({ vertices: graph.nodes.length, edges: graph.edges.length })
     if (polygonPoints.length) renderPolygon()
     if (!options.internal) {
       setStatus(`Graph: ${graph.nodes.length} nodes, ${graph.edges.length} edges`, 'success')
@@ -705,7 +714,18 @@ async function finalizePendingPoints(batch: Array<{ id: string; location: LatLng
       await new Promise((resolve) => window.setTimeout(resolve, 250))
       return
     }
+    if (coverage.deferred || stillPlacingPoints()) {
+      pendingPointFinalizations.unshift(...pending)
+      debugLog('points', 'finalize:defer', {
+        pending: pending.length,
+        selectedPoints: selectedPoints.length,
+        queued: pendingPointFinalizations.length,
+        deferred: Boolean(coverage.deferred),
+      })
+      return
+    }
     setStatus('Could not load graph for points. Try again or reduce radius.', 'error')
+    if (graph) refreshGraphDisplay()
     renderer.setPoints(selectedPoints)
     renderPointList()
     return
@@ -764,6 +784,46 @@ async function waitForFinalizationQueueReady(): Promise<void> {
   }
 }
 
+function stillPlacingPoints(): boolean {
+  return pendingPointFinalizations.length > 0
+    || selectedPoints.some((point) => point.snappedNode < 0)
+}
+
+/** Wait until rapid point clicks finish and every unsnapped point is queued for finalize. */
+async function waitForDrainBatchReady(): Promise<void> {
+  const started = Date.now()
+  for (;;) {
+    await waitForPointSelectionToSettle()
+    await waitForFinalizationQueueReady()
+
+    const pointCount = selectedPoints.length
+    const queueSize = pendingPointFinalizations.length
+    await new Promise((resolve) => window.setTimeout(resolve, POINT_CLICK_COALESCE_MS))
+
+    const unsnapped = selectedPoints.filter((point) => point.snappedNode < 0)
+    const queuedIds = new Set(pendingPointFinalizations.map((entry) => entry.id))
+    const allUnsnappedQueued = unsnapped.length === 0 || unsnapped.every((point) => queuedIds.has(point.id))
+    const stable = selectedPoints.length === pointCount && pendingPointFinalizations.length === queueSize
+
+    if (stable && allUnsnappedQueued) {
+      debugLog('points', 'drain:batch-ready', {
+        points: selectedPoints.length,
+        queued: pendingPointFinalizations.length,
+        ms: Date.now() - started,
+      })
+      return
+    }
+
+    if (Date.now() - started >= POINT_CLICK_SETTLE_MAX_MS) {
+      debugLog('points', 'drain:batch-timeout', {
+        points: selectedPoints.length,
+        queued: pendingPointFinalizations.length,
+      })
+      return
+    }
+  }
+}
+
 async function drainPointFinalizations(): Promise<void> {
   if (drainingPointFinalizations) {
     debugLog('points', 'drain:skip-already-draining', { queued: pendingPointFinalizations.length })
@@ -773,8 +833,7 @@ async function drainPointFinalizations(): Promise<void> {
   debugLog('points', 'drain:start', { queued: pendingPointFinalizations.length })
   try {
     while (pendingPointFinalizations.length && !graphLoadFatalError) {
-      await waitForPointSelectionToSettle()
-      await waitForFinalizationQueueReady()
+      await waitForDrainBatchReady()
       if (!pendingPointFinalizations.length || graphLoadFatalError) break
       const batch = pendingPointFinalizations.splice(0, pendingPointFinalizations.length)
       debugLog('points', 'drain:batch', { batch: batch.length, remaining: pendingPointFinalizations.length })
@@ -900,7 +959,8 @@ function updateStats(stats: Record<string, string | number>): void {
   const loadedStats = graph
     ? { loadedVertices: graph.nodes.length, loadedEdges: graph.edges.length }
     : {}
-  statsEl.innerHTML = Object.entries({ ...loadedStats, ...stats })
+  const merged = { ...stats, ...loadedStats }
+  statsEl.innerHTML = Object.entries(merged)
     .map(([key, value]) => `<div><dt>${humanize(key)}</dt><dd>${String(value)}</dd></div>`)
     .join('')
 }
@@ -1010,11 +1070,6 @@ function scheduleSelectionRerun(clearResult = false): void {
 
 function schedulePointFinalization(pointId: string, location: LatLng): void {
   pendingPointFinalizations.push({ id: pointId, location })
-  const unsettled = selectedPoints.filter((point) => point.snappedNode < 0).length
-  if (graphLoadQueue.isInFlight() && unsettled > 1) {
-    debugLog('points', 'finalize:cancel-inflight', { unsettled, queued: pendingPointFinalizations.length })
-    graphLoadQueue.cancel()
-  }
   void drainPointFinalizations()
 }
 
@@ -1050,7 +1105,8 @@ function uncoveredPointLocations(): LatLng[] {
 
 function pointIsCoveredByGraph(location: LatLng): boolean {
   if (!graph?.edges.length) return false
-  return nearestPointOnGraph(graph, location).distance <= SNAP_RELOAD_DISTANCE_METERS
+  const limit = snapCoverageLimitMeters(radiusMeters(), SNAP_RELOAD_DISTANCE_METERS)
+  return nearestPointOnGraph(graph, location).distance <= limit
 }
 
 function graphCoversPoints(locations: LatLng[]): boolean {
@@ -1062,10 +1118,11 @@ function graphCoversPoints(locations: LatLng[]): boolean {
     })
     return false
   }
+  const limit = snapCoverageLimitMeters(radiusMeters(), SNAP_RELOAD_DISTANCE_METERS)
   for (const point of locations) {
     const snap = nearestPointOnGraph(graph, point).distance
-    if (snap > SNAP_RELOAD_DISTANCE_METERS) {
-      debugLog('coverage', 'miss:snap', { point, snapM: Math.round(snap), limit: SNAP_RELOAD_DISTANCE_METERS })
+    if (snap > limit) {
+      debugLog('coverage', 'miss:snap', { point, snapM: Math.round(snap), limit })
       return false
     }
   }
@@ -1101,8 +1158,32 @@ function refreshGraphDisplay(): void {
   if (!graph) return
   renderer.setGraph(graph)
   renderer.setPoints(selectedPoints)
+  updateStats({ vertices: graph.nodes.length, edges: graph.edges.length })
   updateUrl()
   updateOperationEstimates()
+}
+
+function scheduleProgressiveGraphDisplay(): void {
+  if (progressiveRefreshFrame !== undefined) return
+  progressiveRefreshFrame = requestAnimationFrame(() => {
+    progressiveRefreshFrame = undefined
+    refreshGraphDisplay()
+  })
+}
+
+function finalizePointSnaps(): void {
+  if (!graph?.edges.length) return
+  resnapPointsOntoGraph(selectedPoints.map((point) => ({ ...point })), { skipRender: true })
+}
+
+function pointsAreRoutable(): boolean {
+  if (!graph?.edges.length || !selectedPoints.length) return false
+  finalizePointSnaps()
+  const limit = snapCoverageLimitMeters(radiusMeters(), SNAP_RELOAD_DISTANCE_METERS)
+  for (const point of selectedPoints) {
+    if (point.snappedNode < 0 || point.snapDistance > limit) return false
+  }
+  return terminalsReachable()
 }
 
 function terminalBridgeLocation(point: PointSelection): LatLng {
@@ -1266,57 +1347,95 @@ async function loadPointPatchesAndBridge(
 
   const bridgeResult = await bridgeDisconnectedTerminals(work, padding)
   if (bridgeResult === 'aborted') return 'aborted'
-  return graphCoversPoints(locations) && terminalsReachable()
+  return expansionComplete(locations)
 }
 
-async function loadSpreadPointsGraph(
+function expansionComplete(locations: LatLng[]): boolean {
+  if (graphCoversPoints(locations) && terminalsReachable()) return true
+  finalizePointSnaps()
+  return pointsAreRoutable()
+}
+
+async function loadElongatedCorridorGraph(
   work: GraphLoadToken,
   padding: number,
 ): Promise<boolean | 'aborted'> {
   const locations = selectedPoints.map((point) => point.location)
-  debugLog('expand', 'corridor-first', {
+  const spanM = pointSetSpanMeters(locations)
+  debugLog('expand', 'corridor-bbox-first', {
     points: locations.length,
-    spanM: Math.round(pointSetSpanMeters(locations)),
+    spanM: Math.round(spanM),
+    elongated: isElongatedPointSet(locations),
   })
+
+  for (const extraPadding of [0, 100, 200]) {
+    const currentLocations = selectedPoints.map((point) => point.location)
+    const region = elongatedCorridorRegion(currentLocations, padding + extraPadding)
+    debugLog('expand', 'corridor-bbox', {
+      padding: padding + extraPadding,
+      spanM: Math.round(boundsSpanMeters(region.bounds)),
+      points: currentLocations.length,
+    })
+    const loaded = await loadGraph(region, [], work, {
+      preserveSelectedPoints: true,
+      internal: true,
+      merge: false,
+      deferUi: true,
+      timeoutMs: BULK_FETCH_TIMEOUT_MS,
+      statusContext: 'trail corridor',
+    })
+    if (!loaded) {
+      if (work.signal.aborted || !graphLoadQueue.isCurrent(work)) return 'aborted'
+      continue
+    }
+    syncLastBoundsToPoints(padding + extraPadding)
+    resnapPointsOntoGraph(selectedPoints.map((point) => ({ ...point })), { skipRender: true })
+    if (expansionComplete(currentLocations)) return true
+  }
+
+  const patchRadii = [
+    padding,
+    Math.min(padding + 200, padding * 2),
+    Math.min(Math.round(padding * 2.5), TRAIL_MAX_PATCH_RADIUS_METERS),
+  ]
+  for (const point of selectedPoints) {
+    if (pointIsCoveredByGraph(point.location)) continue
+    for (const radiusM of patchRadii) {
+      if (pointIsCoveredByGraph(point.location)) break
+      debugLog('expand', 'patch-wide', { label: point.label, radiusM })
+      const loaded = await loadPatchAtLocation(
+        work,
+        point.location,
+        radiusM,
+        PATCH_FETCH_TIMEOUT_MS,
+        `point ${point.label}`,
+      )
+      if (!loaded && (work.signal.aborted || !graphLoadQueue.isCurrent(work))) return 'aborted'
+    }
+  }
+
+  resnapPointsOntoGraph(selectedPoints.map((point) => ({ ...point })), { skipRender: true })
+  syncLastBoundsToPoints(padding)
+  if (expansionComplete(selectedPoints.map((point) => point.location))) return true
 
   if (selectedPoints.length >= 2) {
     const chain = await bridgeElongatedChain(work, padding)
     if (chain === 'aborted') return 'aborted'
     resnapPointsOntoGraph(selectedPoints.map((point) => ({ ...point })), { skipRender: true })
-    syncLastBoundsToPoints(padding)
-    if (graphCoversPoints(locations) && terminalsReachable()) return true
+    if (expansionComplete(selectedPoints.map((point) => point.location))) return true
   }
-
-  const widePadding = Math.min(padding + 200, padding * 2)
-  for (const point of selectedPoints) {
-    if (pointIsCoveredByGraph(point.location)) continue
-    debugLog('expand', 'patch-wide', { label: point.label, radiusM: widePadding })
-    const loaded = await loadPatchAtLocation(
-      work,
-      point.location,
-      widePadding,
-      PATCH_FETCH_TIMEOUT_MS,
-      `point ${point.label}`,
-    )
-    if (!loaded && (work.signal.aborted || !graphLoadQueue.isCurrent(work))) return 'aborted'
-  }
-
-  resnapPointsOntoGraph(selectedPoints.map((point) => ({ ...point })), { skipRender: true })
-  syncLastBoundsToPoints(padding)
-  if (graphCoversPoints(locations) && terminalsReachable()) return true
 
   const bridgeResult = await bridgeDisconnectedTerminals(work, padding)
   if (bridgeResult === 'aborted') return 'aborted'
-  return graphCoversPoints(locations) && terminalsReachable()
+  return expansionComplete(selectedPoints.map((point) => point.location))
 }
 
 async function loadBboxForAllPoints(
   work: GraphLoadToken,
   padding: number,
 ): Promise<boolean | 'aborted'> {
-  const locations = selectedPoints.map((point) => point.location)
-
   for (const extraPadding of [0, 100]) {
+    const locations = selectedPoints.map((point) => point.location)
     const region = fetchRegionFromPointSet(locations, padding + extraPadding)
     debugLog('expand', 'bbox', {
       points: locations.length,
@@ -1340,18 +1459,19 @@ async function loadBboxForAllPoints(
     }
     syncLastBoundsToPoints(padding + extraPadding)
     resnapPointsOntoGraph(selectedPoints.map((point) => ({ ...point })), { skipRender: true })
-    if (graphCoversPoints(locations) && terminalsReachable()) return true
+    if (expansionComplete(locations)) return true
   }
 
   const bridgeResult = await bridgeDisconnectedTerminals(work, padding)
   if (bridgeResult === 'aborted') return 'aborted'
-  if (graphCoversPoints(locations) && terminalsReachable()) return true
+  const locations = selectedPoints.map((point) => point.location)
+  if (expansionComplete(locations)) return true
 
   debugLog('expand', 'patch-fallback', { points: locations.length })
   const patched = await loadPointPatchesAndBridge(work, padding)
   if (patched === 'aborted') return 'aborted'
   syncLastBoundsToPoints(padding)
-  return graphCoversPoints(locations) && terminalsReachable()
+  return expansionComplete(selectedPoints.map((point) => point.location))
 }
 
 async function bridgeBetweenLocations(
@@ -1501,48 +1621,58 @@ async function loadSparsePointPatches(
   work: GraphLoadToken,
   padding: number,
 ): Promise<boolean | 'aborted'> {
-  const maxSteps = Math.max(selectedPoints.length * 2, 4)
-  for (let step = 0; step < maxSteps; step++) {
-    const locations = uncoveredPointLocations()
-    if (!locations.length) break
+  try {
+    const maxSteps = Math.max(selectedPoints.length * 2, 4)
+    for (let step = 0; step < maxSteps; step++) {
+      const locations = uncoveredPointLocations()
+      if (!locations.length) break
 
-    const location = locations[0]!
-    const uncoveredCount = locations.length
-    setStatus(`Loading graph… (${selectedPoints.length - uncoveredCount + 1}/${selectedPoints.length})`, 'loading')
+      const location = locations[0]!
+      const uncoveredCount = locations.length
+      setStatus(`Loading graph… (${selectedPoints.length - uncoveredCount + 1}/${selectedPoints.length})`, 'loading')
 
-    const useIncremental = Boolean(graph?.edges.length)
-    const patchPadding = useIncremental
-      ? Math.min(padding, SNAP_RELOAD_DISTANCE_METERS + PATCH_EXTRA_MARGIN_METERS)
-      : padding
-    const fetchBounds = boundsFromCenter(location, patchPadding)
-    lastBounds = useIncremental && lastBounds ? unionBounds(lastBounds, fetchBounds) : fetchBounds
+      const useIncremental = Boolean(graph?.edges.length)
+      const patchPadding = useIncremental
+        ? Math.min(padding, SNAP_RELOAD_DISTANCE_METERS + PATCH_EXTRA_MARGIN_METERS)
+        : padding
+      const fetchBounds = boundsFromCenter(location, patchPadding)
+      lastBounds = useIncremental && lastBounds ? unionBounds(lastBounds, fetchBounds) : fetchBounds
 
-    const loaded = await loadGraph(fetchBounds, [], work, {
-      preserveSelectedPoints: true,
-      internal: true,
-      merge: useIncremental,
-      deferUi: true,
-      timeoutMs: PATCH_FETCH_TIMEOUT_MS,
-    })
-    if (!loaded) {
-      if (work.signal.aborted || !graphLoadQueue.isCurrent(work)) return 'aborted'
-      continue
+      const loaded = await loadGraph(fetchBounds, [], work, {
+        preserveSelectedPoints: true,
+        internal: true,
+        merge: useIncremental,
+        deferUi: true,
+        timeoutMs: PATCH_FETCH_TIMEOUT_MS,
+      })
+      if (!loaded) {
+        if (work.signal.aborted || !graphLoadQueue.isCurrent(work)) return 'aborted'
+        continue
+      }
     }
-  }
 
-  resnapPointsOntoGraph(selectedPoints.map((point) => ({ ...point })), { skipRender: true })
-  const bridgeResult = await bridgeDisconnectedTerminals(work, padding)
-  if (bridgeResult === 'aborted') return 'aborted'
-  const locations = selectedPoints.map((point) => point.location)
-  if (graphCoversPoints(locations) && terminalsReachable()) return true
-  debugLog('expand', 'patch-fallback', { points: locations.length })
-  return loadPointPatchesAndBridge(work, padding)
+    resnapPointsOntoGraph(selectedPoints.map((point) => ({ ...point })), { skipRender: true })
+    const bridgeResult = await bridgeDisconnectedTerminals(work, padding)
+    if (bridgeResult === 'aborted') return 'aborted'
+    const locations = selectedPoints.map((point) => point.location)
+    if (graphCoversPoints(locations) && terminalsReachable()) return true
+    debugLog('expand', 'patch-fallback', { points: locations.length })
+    return loadPointPatchesAndBridge(work, padding)
+  } finally {
+    refreshGraphDisplay()
+  }
 }
 
 async function loadGraphForSelectedPoints(
   work: GraphLoadToken,
   padding: number,
 ): Promise<boolean | 'aborted'> {
+  if (!selectedPoints.length) return true
+
+  if (stillPlacingPoints()) {
+    await waitForDrainBatchReady()
+  }
+
   const locations = selectedPoints.map((point) => point.location)
   if (!locations.length) return true
 
@@ -1580,12 +1710,11 @@ async function loadGraphForSelectedPoints(
     debugLog('expand', 'partial-fallback-bbox', { uncovered: uncovered.length })
   }
 
-  await waitForPointSelectionToSettle()
-
-  if (shouldPreferPatchBridgeLoad(locations)) {
-    const spread = await loadSpreadPointsGraph(work, padding)
+  const spanM = pointSetSpanMeters(locations)
+  if (isElongatedPointSet(locations) && spanM > 600 && spanM <= ELONGATED_CORRIDOR_MAX_SPAN_METERS) {
+    const corridor = await loadElongatedCorridorGraph(work, padding)
     refreshGraphDisplay()
-    return spread
+    return corridor
   }
 
   const bboxResult = await loadBboxForAllPoints(work, padding)
@@ -1593,7 +1722,7 @@ async function loadGraphForSelectedPoints(
   return bboxResult
 }
 
-async function expandGraphForPoints(): Promise<boolean | 'aborted'> {
+async function expandGraphForPoints(): Promise<boolean | 'aborted' | 'deferred'> {
   if (pointExpansionFlight) {
     debugLog('expand', 'coalesce', { points: selectedPoints.length })
     return pointExpansionFlight
@@ -1604,7 +1733,7 @@ async function expandGraphForPoints(): Promise<boolean | 'aborted'> {
   return pointExpansionFlight
 }
 
-async function expandGraphForPointsOnce(): Promise<boolean | 'aborted'> {
+async function expandGraphForPointsOnce(): Promise<boolean | 'aborted' | 'deferred'> {
   debugLog('expand', 'start', {
     points: selectedPoints.length,
     queueInFlight: graphLoadQueue.isInFlight(),
@@ -1627,10 +1756,13 @@ async function expandGraphForPointsOnce(): Promise<boolean | 'aborted'> {
     }, (update) => setStatus(update.message, update.tone))
     debugLog('expand', 'done', outcome)
     if (outcome.superseded) return 'aborted'
+    if (outcome.result === 'deferred') return 'deferred'
     return outcome.result
   } catch (error) {
     debugLog('expand', 'error', { error: error instanceof Error ? error.message : String(error) })
     return false
+  } finally {
+    refreshGraphDisplay()
   }
 }
 
@@ -1658,7 +1790,7 @@ function terminalComponentGroups(): Map<number, number[]> {
   return groups
 }
 
-async function runPointExpansion(work: GraphLoadToken): Promise<boolean | 'aborted'> {
+async function runPointExpansion(work: GraphLoadToken): Promise<boolean | 'aborted' | 'deferred'> {
   try {
     applyRadiusBoundsSource(selectedPoints.map((point) => point.location))
     const padding = radiusMeters()
@@ -1677,7 +1809,7 @@ async function runPointExpansion(work: GraphLoadToken): Promise<boolean | 'abort
     renderPointList()
     updateUrl()
 
-    const covered = graphCoversPoints(selectedPoints.map((point) => point.location)) && terminalsReachable()
+    const covered = pointsAreRoutable()
     debugLog('expand', 'post-resnap', {
       covered,
       connected: terminalsReachable(),
@@ -1689,26 +1821,35 @@ async function runPointExpansion(work: GraphLoadToken): Promise<boolean | 'abort
     })
     return false
   }
-  return graphCoversPoints(selectedPoints.map((point) => point.location)) && terminalsReachable()
+  if (!pointsAreRoutable() && stillPlacingPoints()) {
+    debugLog('expand', 'defer:still-placing', { points: selectedPoints.length })
+    return 'deferred'
+  }
+  return pointsAreRoutable()
 }
 
 async function ensureGraphCoversPoints(): Promise<PointCoverageResult> {
-  const locations = selectedPoints.map((point) => point.location)
-  if (!locations.length) return { ok: graph !== undefined, reloaded: false }
+  if (!selectedPoints.length) return { ok: graph !== undefined, reloaded: false }
 
   const uncovered = uncoveredPoints()
   const incrementalMove = canExpandIncrementally(uncovered)
-  if (!incrementalMove) {
-    await waitForPointSelectionToSettle()
+  if (!incrementalMove && stillPlacingPoints()) {
+    await waitForDrainBatchReady()
   }
 
+  const locations = selectedPoints.map((point) => point.location)
   const needsReload = !graphCoversPoints(locations)
   debugLog('coverage', 'ensure', { needsReload, points: locations.length })
   if (!needsReload) return { ok: true, reloaded: false }
   const expanded = await expandGraphForPoints()
+  if (expanded === 'deferred') return { ok: false, reloaded: false, deferred: true }
   if (expanded === 'aborted') return { ok: false, reloaded: false, aborted: true }
-  if (!expanded) return { ok: false, reloaded: false }
-  const covered = graphCoversPoints(selectedPoints.map((point) => point.location))
+  if (!expanded) {
+    if (stillPlacingPoints()) return { ok: false, reloaded: false, deferred: true }
+    const routable = pointsAreRoutable()
+    return { ok: routable, reloaded: needsReload && routable }
+  }
+  const covered = pointsAreRoutable()
   return { ok: covered, reloaded: needsReload && covered }
 }
 
@@ -1823,7 +1964,8 @@ function failPendingPointFinalizations(
   _pending: Array<{ id: string; location: LatLng }>,
   message: string,
 ): void {
-  renderer.setPoints(selectedPoints)
+  if (graph) refreshGraphDisplay()
+  else renderer.setPoints(selectedPoints)
   renderPointList()
   graphLoadAbortRetries = 0
   graphLoadFatalError = false

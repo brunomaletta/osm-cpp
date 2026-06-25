@@ -14,6 +14,7 @@ export type RenderController = {
 
 const RESULT_EDGE_COLOR = '#f97316'
 const POSTMAN_BASE_COLOR = '#475569'
+const GRAPH_EDGES_PER_LAYER = 250
 
 export function createRenderController(
   map: L.Map,
@@ -30,16 +31,25 @@ export function createRenderController(
   let animatedLine: L.Polyline | undefined
   let currentRoute: RouteResult | undefined
   let postmanPlayback = false
+  const graphCanvasRenderer = L.canvas({ padding: 0.5 })
 
   function setGraph(graph: StreetGraph | undefined) {
     graphLayer.clearLayers()
-    if (!graph) return
-    const lines = graph.edges.map((edge) => toLeaflet(edge.geometry))
-    L.polyline(lines, {
-      color: '#0f172a',
-      opacity: 0.48,
-      weight: 2,
-    }).addTo(graphLayer)
+    if (!graph?.edges.length) return
+    const lines: L.LatLngExpression[][] = []
+    for (const edge of graph.edges) {
+      if (edge.geometry.length < 2) continue
+      lines.push(toLeaflet(edge.geometry))
+    }
+    if (!lines.length) return
+    for (let i = 0; i < lines.length; i += GRAPH_EDGES_PER_LAYER) {
+      L.polyline(lines.slice(i, i + GRAPH_EDGES_PER_LAYER), {
+        color: '#94a3b8',
+        opacity: 0.85,
+        weight: 2.5,
+        renderer: graphCanvasRenderer,
+      }).addTo(graphLayer)
+    }
   }
 
   function setRoute(route: RouteResult | undefined) {

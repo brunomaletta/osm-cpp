@@ -209,11 +209,32 @@ export function bridgeFetchBounds(a: LatLng, b: LatLng, paddingMeters: number): 
   return padBounds(boundsFromPoints([a, b]), Math.min(paddingMeters, 280))
 }
 
+/** Thin or widened corridor along the axis from first to last point (trails, valleys). */
+export function elongatedCorridorRegion(points: LatLng[], paddingMeters: number): OsmFetchRegion {
+  if (points.length < 2) {
+    return { bounds: boundsFromCenter(points[0]!, paddingMeters) }
+  }
+  if (isCollinearSet(points)) {
+    const [a, b] = farthestPair(points)
+    return { bounds: boundsAroundSegment(a, b, paddingMeters) }
+  }
+  const ordered = orderPointsAlongAxis(points)
+  const start = ordered[0]!
+  const end = ordered[ordered.length - 1]!
+  const halfWidth = bridgeCorridorHalfWidth(start, end, paddingMeters)
+  return { bounds: boundsAroundSegment(start, end, halfWidth) }
+}
+
 /** Elongated corridors: per-point patches + bridges. Compact urban spreads use one bulk fetch. */
 export function shouldPreferPatchBridgeLoad(points: LatLng[], minSpanMeters = 600): boolean {
   const span = pointSetSpanMeters(points)
   if (span <= minSpanMeters) return false
-  return isElongatedPointSet(points, minSpanMeters)
+  if (!isElongatedPointSet(points, minSpanMeters)) return false
+  // City-wide spreads (>8 km) need one bbox, not dozens of corridor chunks.
+  if (span > 8_000) return false
+  // Collinear trails are cheaper as one thin corridor bbox.
+  if (isCollinearSet(points)) return false
+  return true
 }
 
 export function orderPointsAlongAxis(points: LatLng[]): LatLng[] {
@@ -229,6 +250,11 @@ export function orderPointsAlongAxis(points: LatLng[]): LatLng[] {
     const r = toLocalMeters(right, origin)
     return (l.x * ux + l.y * uy) - (r.x * ux + r.y * uy)
   })
+}
+
+/** Max snap distance that still counts as "covered" for a given search radius. */
+export function snapCoverageLimitMeters(searchRadiusMeters: number, baseLimitMeters = 120): number {
+  return Math.max(baseLimitMeters, Math.min(searchRadiusMeters, 400))
 }
 
 export function describeFetchRegionArea(region: Bounds | OsmFetchRegion): string {

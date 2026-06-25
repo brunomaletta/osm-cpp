@@ -6,11 +6,14 @@ import {
   bufferConvexPolygon,
   convexHull,
   fetchRegionFromPointSet,
+  elongatedCorridorRegion,
   padBounds,
   boundsFromPoints,
+  boundsSpanMeters,
   shouldPreferPatchBridgeLoad,
   pointSetSpanMeters,
   isElongatedPointSet,
+  snapCoverageLimitMeters,
   describeFetchRegionArea,
 } from './geo'
 
@@ -59,15 +62,16 @@ describe('convex hull fetch regions', () => {
     expect(region.polygon).toBeUndefined()
   })
 
-  test('spread collinear layout prefers patch-bridge strategy', () => {
+  test('spread collinear layout uses thin corridor bbox', () => {
     const points = [
       { lat: -20.088, lon: -43.984 },
       { lat: -20.095, lon: -43.9842 },
       { lat: -20.103, lon: -43.984 },
     ]
-    expect(shouldPreferPatchBridgeLoad(points)).toBe(true)
-    const region = fetchRegionFromPointSet(points, 350)
-    expect(region.polygon).toBeUndefined()
+    expect(shouldPreferPatchBridgeLoad(points)).toBe(false)
+    const region = elongatedCorridorRegion(points, 350)
+    const bbox = fetchRegionFromPointSet(points, 350)
+    expect(region.bounds).toEqual(bbox.bounds)
     const giant = padBounds(boundsFromPoints(points), 950)
     expect(approxBoundsAreaSqMeters(region.bounds)).toBeLessThan(approxBoundsAreaSqMeters(giant) * 0.4)
   })
@@ -84,6 +88,37 @@ describe('convex hull fetch regions', () => {
     expect(shouldPreferPatchBridgeLoad(points)).toBe(false)
     const region = fetchRegionFromPointSet(points, 350)
     expect(region.polygon).toBeUndefined()
+  })
+
+  test('very wide point sets skip corridor patch-bridge', () => {
+    const points = [
+      { lat: -19.923, lon: -43.943 },
+      { lat: -19.934, lon: -43.951 },
+      { lat: -20.088, lon: -43.984 },
+      { lat: -20.103, lon: -43.984 },
+    ]
+    expect(pointSetSpanMeters(points)).toBeGreaterThan(8_000)
+    expect(shouldPreferPatchBridgeLoad(points)).toBe(false)
+  })
+
+  test('elongated trail corridor uses patch-bridge below 8km when not collinear', () => {
+    const points = [
+      { lat: -20.088, lon: -43.984 },
+      { lat: -20.095, lon: -43.9842 },
+      { lat: -20.110, lon: -43.984 },
+      { lat: -20.132, lon: -43.978 },
+    ]
+    expect(pointSetSpanMeters(points)).toBeGreaterThan(2_500)
+    expect(pointSetSpanMeters(points)).toBeLessThan(8_000)
+    expect(shouldPreferPatchBridgeLoad(points)).toBe(true)
+    const corridor = elongatedCorridorRegion(points, 350)
+    expect(boundsSpanMeters(corridor.bounds)).toBeGreaterThan(2_000)
+  })
+
+  test('snapCoverageLimitMeters scales with search radius', () => {
+    expect(snapCoverageLimitMeters(350)).toBe(350)
+    expect(snapCoverageLimitMeters(350)).toBeGreaterThan(198)
+    expect(snapCoverageLimitMeters(100)).toBe(120)
   })
 
   test('describeFetchRegionArea formats bbox area in km²', () => {
