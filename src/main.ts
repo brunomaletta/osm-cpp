@@ -102,7 +102,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       <div>
         <h2>Algorithm</h2>
         <div id="algorithmChoices" class="choice-grid algorithm-grid">
-          <button class="choice-card cost-card" data-algorithm="tspPath" type="button" aria-pressed="false">
+          <button class="choice-card cost-card active" data-algorithm="tspPath" type="button" aria-pressed="true">
             <span class="choice-icon">PATH</span>
             <strong class="choice-title">Open TSP</strong>
             <span class="choice-foot"><small class="choice-complexity">O(2^p)</small><span class="choice-badge"></span></span>
@@ -127,7 +127,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
             <strong class="choice-title">Steiner</strong>
             <span class="choice-foot"><small class="choice-complexity">O(3^p)</small><span class="choice-badge"></span></span>
           </button>
-          <button class="choice-card cost-card active" data-algorithm="postman" type="button" aria-pressed="true">
+          <button class="choice-card cost-card" data-algorithm="postman" type="button" aria-pressed="false">
             <span class="choice-icon">CP</span>
             <strong class="choice-title">Postman</strong>
             <span class="choice-foot"><small class="choice-complexity">O(2^k)</small><span class="choice-badge"></span></span>
@@ -137,10 +137,10 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       <div>
         <h2>Input</h2>
         <div id="inputChoices" class="choice-grid profile-grid">
-          <button class="choice-card" data-input-mode="points" type="button" aria-pressed="false">
+          <button class="choice-card active" data-input-mode="points" type="button" aria-pressed="true">
             <span class="choice-icon">PTS</span><strong>Points</strong><small>Terminals</small>
           </button>
-          <button class="choice-card active" data-input-mode="polygon" type="button" aria-pressed="true">
+          <button class="choice-card" data-input-mode="polygon" type="button" aria-pressed="false">
             <span class="choice-icon">POLY</span><strong>Polygon</strong><small>Region</small>
           </button>
         </div>
@@ -156,9 +156,9 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       </label>
     </section>
     </div>
-    <footer class="panel-status" aria-live="polite">
+    <footer class="panel-status" data-tone="idle" aria-live="polite">
       <p class="panel-status-label">Status</p>
-      <p id="status">Click map to load. Shift+drag for region.</p>
+      <p id="status" data-tone="idle">Click map to load. Shift+drag for region.</p>
     </footer>
   </aside>
   <main class="map-shell">
@@ -203,7 +203,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       <details class="edge-drawer" id="algorithmPanel">
         <summary class="edge-tab"><span id="algorithmTabLabel">Info</span></summary>
         <div class="edge-panel side-panel-info">
-          <h2 class="edge-panel-title" id="infoTitle">Chinese Postman</h2>
+          <h2 class="edge-panel-title" id="infoTitle">Open TSP Path</h2>
           <p><strong>Complexity:</strong> <span id="complexity"></span></p>
           <p><strong>Est. operations:</strong> <span id="operationCost">—</span> <span class="muted cost-budget-note">(~5M ≈ 2s)</span></p>
           <p><strong>Guarantee:</strong> <span id="approximation"></span></p>
@@ -227,18 +227,19 @@ let polygonPoints: LatLng[] = []
 let polygonDragging = false
 let suppressNextMapClick = false
 let movingPointId: string | undefined
-let selectedAlgorithm: Algorithm = 'postman'
+let selectedAlgorithm: Algorithm = 'tspPath'
 let selectedProfile: TransportProfile = 'pedestrian'
-let selectedInputMode: InputMode = 'polygon'
+let selectedInputMode: InputMode = 'points'
 let progress = 1
 let playing = false
 let animationFrame = 0
-let workSerial = 0
-let activeFetchController: AbortController | undefined
+let graphLoadSerial = 0
+let algorithmWorkSerial = 0
+let activeGraphLoadController: AbortController | undefined
 let pendingRerunTimer: number | undefined
 const pendingPointFinalizations: Array<{ id: string; location: LatLng }> = []
 let drainingPointFinalizations = false
-let graphExpansionChain: Promise<boolean> = Promise.resolve(true)
+let graphExpansionChain: Promise<unknown> = Promise.resolve()
 const SNAP_RELOAD_DISTANCE_METERS = 120
 
 const map = L.map('map', {
@@ -280,9 +281,19 @@ const statsEl = byId<HTMLElement>('stats')
 const pointListEl = byId<HTMLElement>('pointList')
 const progressInput = byId<HTMLInputElement>('progress')
 
-type WorkToken = {
+type GraphLoadToken = {
   id: number
   signal: AbortSignal
+}
+
+type AlgorithmWorkToken = {
+  id: number
+}
+
+type PointCoverageResult = {
+  ok: boolean
+  reloaded: boolean
+  aborted?: boolean
 }
 
 installHoldDragBox(map, async (bounds) => {
@@ -306,7 +317,7 @@ map.on('click', async (event: L.LeafletMouseEvent) => {
     renderPolygon()
     updateUrl()
     if (polygonPoints.length < 3) {
-      setStatus(`Vertex ${polygonPoints.length}. Need ${3 - polygonPoints.length} more.`)
+      setStatus(`Vertex ${polygonPoints.length}. Need ${3 - polygonPoints.length} more.`, 'warn')
     }
     requestAnimationFrame(() => pendingMarker.remove())
     scheduleSelectionRerun(true)
@@ -384,21 +395,25 @@ function installEdgeDock(): void {
 async function loadGraph(
   bounds: Bounds,
   restorePointLocations: LatLng[] = [],
-  work = beginWork(),
+  work?: GraphLoadToken,
   options: { preserveSelectedPoints?: boolean } = {},
 ): Promise<boolean> {
-  setStatus('Loading graph…')
+  const loadWork = work ?? beginGraphLoad()
+  setStatus('Loading graph…', 'loading')
   let data
   try {
-    data = await fetchOsmGraph(bounds, currentProfile(), work.signal)
+    data = await fetchOsmGraph(bounds, currentProfile(), loadWork.signal)
   } catch (error) {
-    if (work.signal.aborted) return false
-    throw error
+    if (loadWork.signal.aborted) return false
+    setStatus(error instanceof Error ? error.message : 'Graph load failed.', 'error')
+    return false
   }
-  if (!isCurrentWork(work)) return false
+  if (!isCurrentGraphLoad(loadWork)) return false
   graph = buildStreetGraph(data.elements, currentProfile())
-  if (polygonPoints.length >= 3) graph = clipGraphToPolygon(graph, polygonPoints)
-  if (!isCurrentWork(work)) return false
+  if (polygonPoints.length >= 3 && selectedInputMode === 'polygon') {
+    graph = clipGraphToPolygon(graph, polygonPoints)
+  }
+  if (!isCurrentGraphLoad(loadWork)) return false
   if (!options.preserveSelectedPoints) {
     selectedPoints = []
     if (restorePointLocations.length === 0) {
@@ -415,13 +430,13 @@ async function loadGraph(
   updateUrl()
   if (polygonPoints.length) renderPolygon()
   updateOperationEstimates()
-  setStatus(`Graph: ${graph.nodes.length} nodes, ${graph.edges.length} edges`)
+  setStatus(`Graph: ${graph.nodes.length} nodes, ${graph.edges.length} edges`, 'success')
   return true
 }
 
-async function runCurrentAlgorithm(work = beginWork()): Promise<void> {
+async function runCurrentAlgorithm(work = beginAlgorithmWork()): Promise<void> {
   if (!graph) {
-    setStatus('Load a graph first.')
+    setStatus('Load a graph first.', 'warn')
     return
   }
   if (currentAlgorithm() === 'matching' && selectedPoints.length % 2 === 1) {
@@ -430,16 +445,16 @@ async function runCurrentAlgorithm(work = beginWork()): Promise<void> {
       selectedPoints: selectedPoints.length,
       neededForMatching: 'one more point',
     })
-    setStatus('Matching needs an even point count.')
+    setStatus('Matching needs an even point count.', 'warn')
     return
   }
   try {
     const algorithm = currentAlgorithm()
-    setStatus(`Running ${algorithmInfo[algorithm].title}…`)
+    setStatus(`Running ${algorithmInfo[algorithm].title}…`, 'loading')
     const nextRoute = algorithm === 'postman'
       ? solveChinesePostman(graph)
       : runPointAlgorithm(algorithm as PointAlgorithm, graph, selectedPoints, { tspStartPointId })
-    if (!isCurrentWork(work)) return
+    if (!isCurrentAlgorithmWork(work)) return
     route = applyElevationStats(graph, nextRoute)
     renderer.setRoute(route)
     if (algorithm === 'postman') {
@@ -452,13 +467,13 @@ async function runCurrentAlgorithm(work = beginWork()): Promise<void> {
     }
     const displayStats = { ...route.stats }
     updateStats(displayStats)
-    setStatus(routeSummary(route))
+    setStatus(routeSummary(route), 'success')
     updateResultInfo(route)
     updateUrl()
     void refreshElevationStats(work, graph, route)
   } catch (error) {
-    if (work.signal.aborted) return
-    setStatus(error instanceof Error ? error.message : 'Algorithm failed.')
+    if (!isCurrentAlgorithmWork(work)) return
+    setStatus(error instanceof Error ? error.message : 'Algorithm failed.', 'error')
   }
 }
 
@@ -468,17 +483,15 @@ function applyElevationStats(routeGraph: StreetGraph, result: RouteResult): Rout
   return { ...result, stats: withElevationStats(result.stats, elevationStats) }
 }
 
-async function refreshElevationStats(work: WorkToken, routeGraph: StreetGraph, result: RouteResult): Promise<void> {
+async function refreshElevationStats(work: AlgorithmWorkToken, routeGraph: StreetGraph, result: RouteResult): Promise<void> {
   if (routeGraph.profile !== 'pedestrian' || routePathForElevation(result).length < 2) return
   try {
-    const elevationStats = await enrichElevationStats(routeGraph, result, work.signal)
-    if (!isCurrentWork(work)) return
+    const elevationStats = await enrichElevationStats(routeGraph, result)
+    if (!isCurrentAlgorithmWork(work)) return
     route = { ...result, stats: withElevationStats(result.stats, elevationStats) }
     updateStats(route.stats)
   } catch {
-    if (work.signal.aborted) return
-    route = { ...result, stats: stripElevationStats(result.stats) }
-    updateStats(route.stats)
+    if (!isCurrentAlgorithmWork(work)) return
   }
 }
 
@@ -503,7 +516,7 @@ function addProvisionalPoint(location: LatLng): PointSelection {
   clearRouteResult()
   const point: PointSelection = {
     id: crypto.randomUUID(),
-    label: String.fromCharCode(65 + selectedPoints.length),
+    label: pointLabel(selectedPoints.length),
     location,
     snappedLocation: location,
     snappedNode: -1,
@@ -516,43 +529,66 @@ function addProvisionalPoint(location: LatLng): PointSelection {
   return point
 }
 
-async function finalizePointGraph(pointId: string, location: LatLng): Promise<void> {
-  const index = selectedPoints.findIndex((point) => point.id === pointId)
-  if (index === -1) return
+async function finalizePendingPoints(batch: Array<{ id: string; location: LatLng }>): Promise<void> {
+  const pending = batch.filter((next) => selectedPoints.some((point) => point.id === next.id))
+  if (!pending.length) return
+
   const coverage = await ensureGraphCoversPoints()
   if (!coverage.ok) {
-    if (selectedPoints.some((point) => point.id === pointId)) {
-      selectedPoints = selectedPoints.filter((point) => point.id !== pointId)
-      renderer.setPoints(selectedPoints)
-      renderPointList()
-      updateUrl()
-      setStatus('Graph load failed.')
+    if (coverage.aborted) {
+      pendingPointFinalizations.unshift(...pending)
+      await new Promise((resolve) => window.setTimeout(resolve, 100))
+      return
     }
+    const removed = new Set(pending.map((point) => point.id))
+    selectedPoints = selectedPoints.filter((point) => !removed.has(point.id))
+    renderer.setPoints(selectedPoints)
+    renderPointList()
+    updateUrl()
+    setStatus('Could not load graph for points.', 'error')
     return
   }
   if (!graph) return
-  const currentIndex = selectedPoints.findIndex((point) => point.id === pointId)
-  if (currentIndex === -1) return
+
+  const locations = new Map(pending.map((point) => [point.id, point.location]))
   if (!coverage.reloaded) {
-    const snap = addSnappedPoint(graph, location)
-    graph = snap.graph
-    selectedPoints[currentIndex] = {
-      ...selectedPoints[currentIndex],
-      location,
-      snappedLocation: snap.location,
-      snappedNode: snap.nodeId,
-      snapDistance: snap.distance,
-    }
-    renderer.setGraph(graph)
-    renderer.setPoints(selectedPoints)
-  } else {
-    renderer.setGraph(graph)
-    renderer.setPoints(selectedPoints)
+    let workingGraph = graph
+    selectedPoints = selectedPoints.map((point) => {
+      const location = locations.get(point.id)
+      if (!location) return point
+      const snap = addSnappedPoint(workingGraph, location)
+      workingGraph = snap.graph
+      return {
+        ...point,
+        location,
+        snappedLocation: snap.location,
+        snappedNode: snap.nodeId,
+        snapDistance: snap.distance,
+      }
+    })
+    graph = workingGraph
   }
+  renderer.setGraph(graph)
+  renderer.setPoints(selectedPoints)
   renderPointList()
   updateUrl()
-  setStatus(`Point ${selectedPoints[currentIndex].label} (${selectedPoints.length})`)
+  const last = selectedPoints[selectedPoints.length - 1]
+  setStatus(last ? `Point ${last.label} (${selectedPoints.length})` : `Points: ${selectedPoints.length}`, 'success')
   scheduleSelectionRerun()
+}
+
+async function drainPointFinalizations(): Promise<void> {
+  if (drainingPointFinalizations) return
+  drainingPointFinalizations = true
+  try {
+    while (pendingPointFinalizations.length) {
+      const batch = pendingPointFinalizations.splice(0, pendingPointFinalizations.length)
+      await finalizePendingPoints(batch)
+    }
+  } finally {
+    drainingPointFinalizations = false
+    if (pendingPointFinalizations.length) void drainPointFinalizations()
+  }
 }
 
 function addPoint(location: LatLng, rerun = true): void {
@@ -561,7 +597,7 @@ function addPoint(location: LatLng, rerun = true): void {
   graph = snap.graph
   const point: PointSelection = {
     id: crypto.randomUUID(),
-    label: String.fromCharCode(65 + selectedPoints.length),
+    label: pointLabel(selectedPoints.length),
     location,
     snappedLocation: snap.location,
     snappedNode: snap.nodeId,
@@ -572,7 +608,7 @@ function addPoint(location: LatLng, rerun = true): void {
   renderer.setPoints(selectedPoints)
   renderPointList()
   updateUrl()
-  setStatus(`Point ${point.label} (${selectedPoints.length})`)
+  setStatus(`Point ${point.label} (${selectedPoints.length})`, 'success')
   if (rerun) scheduleSelectionRerun()
 }
 
@@ -603,10 +639,11 @@ async function movePoint(id: string, location: LatLng): Promise<void> {
 
   const coverage = await ensureGraphCoversPoints()
   if (!coverage.ok) {
+    if (coverage.aborted) return
     selectedPoints = previousPoints
     renderer.setPoints(selectedPoints)
     renderPointList()
-    setStatus('Graph load failed.')
+    setStatus('Could not load graph for point.', 'error')
     return
   }
   if (!graph) return
@@ -628,7 +665,7 @@ async function movePoint(id: string, location: LatLng): Promise<void> {
   }
   renderPointList()
   updateUrl()
-  setStatus(`Moved ${selectedPoints[index].label}`)
+  setStatus(`Moved ${selectedPoints[index].label}`, 'success')
   scheduleSelectionRerun()
 }
 
@@ -708,7 +745,7 @@ pointListEl.addEventListener('click', (event) => {
   if (action === 'delete') selectedPoints = relabel(selectedPoints.filter((point) => point.id !== id))
   if (action === 'move') {
     movingPointId = id
-    setStatus('Click map to place point.')
+    setStatus('Click map to place point.', 'warn')
     return
   }
   if (action === 'up' || action === 'down') {
@@ -735,7 +772,7 @@ async function rerunAfterSelectionEdit(): Promise<void> {
   if (selectedInputMode === 'polygon') {
     if (polygonPoints.length < 3) {
       clearCurrentAlgorithmResult()
-      setStatus(`Polygon: ${polygonPoints.length} verts. Need ${3 - polygonPoints.length} more.`)
+      setStatus(`Polygon: ${polygonPoints.length} verts. Need ${3 - polygonPoints.length} more.`, 'warn')
       return
     }
     if (!validatePolygonForRun()) return
@@ -745,7 +782,7 @@ async function rerunAfterSelectionEdit(): Promise<void> {
 
   if (selectedPoints.length < 2) {
     clearCurrentAlgorithmResult()
-    setStatus(`Need ${2 - selectedPoints.length} more point${selectedPoints.length === 1 ? '' : 's'}.`)
+    setStatus(`Need ${2 - selectedPoints.length} more point${selectedPoints.length === 1 ? '' : 's'}.`, 'warn')
     return
   }
   if (currentAlgorithm() === 'matching' && selectedPoints.length % 2 === 1) {
@@ -754,7 +791,7 @@ async function rerunAfterSelectionEdit(): Promise<void> {
       selectedPoints: selectedPoints.length,
       neededForMatching: 'one more point',
     })
-    setStatus('Matching needs an even point count.')
+    setStatus('Matching needs an even point count.', 'warn')
     return
   }
   await runCurrentAlgorithm()
@@ -774,23 +811,8 @@ function schedulePointFinalization(pointId: string, location: LatLng): void {
   void drainPointFinalizations()
 }
 
-async function drainPointFinalizations(): Promise<void> {
-  if (drainingPointFinalizations) return
-  drainingPointFinalizations = true
-  try {
-    while (pendingPointFinalizations.length) {
-      const next = pendingPointFinalizations.shift()!
-      if (!selectedPoints.some((point) => point.id === next.id)) continue
-      await finalizePointGraph(next.id, next.location)
-    }
-  } finally {
-    drainingPointFinalizations = false
-    if (pendingPointFinalizations.length) void drainPointFinalizations()
-  }
-}
-
 function graphCoversPoints(locations: LatLng[]): boolean {
-  if (!graph || !lastBounds || !locations.length) return false
+  if (!graph || !lastBounds || !locations.length || !graph.edges.length) return false
   for (const point of locations) {
     if (!boundsContains(lastBounds, point)) return false
     if (nearestPointOnGraph(graph, point).distance > SNAP_RELOAD_DISTANCE_METERS) return false
@@ -799,7 +821,7 @@ function graphCoversPoints(locations: LatLng[]): boolean {
 }
 
 function resnapPointsOntoGraph(points: PointSelection[]): void {
-  if (!graph) return
+  if (!graph?.edges.length) return
   let workingGraph = graph
   selectedPoints = points.map((point) => {
     const snap = addSnappedPoint(workingGraph, point.location)
@@ -816,47 +838,56 @@ function resnapPointsOntoGraph(points: PointSelection[]): void {
   renderer.setPoints(selectedPoints)
 }
 
-async function expandGraphForPoints(): Promise<boolean> {
-  const runExpansion = async (attempt = 0): Promise<boolean> => {
-    const tspStartId = tspStartPointId
-    const locations = selectedPoints.map((point) => point.location)
-    if (!locations.length) return graph !== undefined
+async function expandGraphForPoints(): Promise<boolean | 'aborted'> {
+  const runExpansion = async (attempt = 0): Promise<boolean | 'aborted'> => {
+    try {
+      const tspStartId = tspStartPointId
+      const locations = selectedPoints.map((point) => point.location)
+      if (!locations.length) return graph !== undefined
 
-    applyRadiusBoundsSource(locations)
-    lastBounds = locations.length === 1
-      ? boundsFromCenter(locations[0], radiusMeters())
-      : padBounds(boundsFromPoints(locations), radiusMeters())
+      applyRadiusBoundsSource(locations)
+      const padding = radiusMeters() * (attempt + 1)
+      lastBounds = locations.length === 1
+        ? boundsFromCenter(locations[0], padding)
+        : padBounds(boundsFromPoints(locations), padding)
 
-    const work = beginWork()
-    const loaded = await loadGraph(lastBounds, [], work, { preserveSelectedPoints: true })
-    if (!loaded) {
-      if (work.signal.aborted) return true
+      const work = beginGraphLoad()
+      const loaded = await loadGraph(lastBounds, [], work, { preserveSelectedPoints: true })
+      if (!loaded) {
+        return work.signal.aborted ? 'aborted' : false
+      }
+      if (!graph?.edges.length) {
+        if (attempt < 4) return runExpansion(attempt + 1)
+        return false
+      }
+
+      resnapPointsOntoGraph(selectedPoints.map((point) => ({ ...point })))
+      tspStartPointId = selectedPoints.some((point) => point.id === tspStartId) ? tspStartId : selectedPoints[0]?.id
+      renderPointList()
+      updateUrl()
+
+      if (!graphCoversPoints(selectedPoints.map((point) => point.location)) && attempt < 4) {
+        return runExpansion(attempt + 1)
+      }
+      return graphCoversPoints(selectedPoints.map((point) => point.location))
+    } catch {
       return false
     }
-    if (!graph) return false
-
-    resnapPointsOntoGraph(selectedPoints.map((point) => ({ ...point })))
-    tspStartPointId = selectedPoints.some((point) => point.id === tspStartId) ? tspStartId : selectedPoints[0]?.id
-    renderPointList()
-    updateUrl()
-
-    if (!graphCoversPoints(selectedPoints.map((point) => point.location)) && attempt < 4) {
-      return runExpansion(attempt + 1)
-    }
-    return graphCoversPoints(selectedPoints.map((point) => point.location))
   }
 
-  graphExpansionChain = graphExpansionChain.then(() => runExpansion(), () => runExpansion())
-  return graphExpansionChain
+  const expansion = graphExpansionChain.then(() => runExpansion())
+  graphExpansionChain = expansion.then(() => true, () => true)
+  return expansion
 }
 
-async function ensureGraphCoversPoints(): Promise<{ ok: boolean; reloaded: boolean }> {
+async function ensureGraphCoversPoints(): Promise<PointCoverageResult> {
   const locations = selectedPoints.map((point) => point.location)
   if (!locations.length) return { ok: graph !== undefined, reloaded: false }
   const needsReload = !graphCoversPoints(locations)
   if (!needsReload) return { ok: true, reloaded: false }
-  const ok = await expandGraphForPoints()
-  if (!ok) return { ok: false, reloaded: false }
+  const expanded = await expandGraphForPoints()
+  if (expanded === 'aborted') return { ok: false, reloaded: false, aborted: true }
+  if (!expanded) return { ok: false, reloaded: false }
   const covered = graphCoversPoints(selectedPoints.map((point) => point.location))
   return { ok: covered, reloaded: needsReload && covered }
 }
@@ -935,7 +966,7 @@ async function reloadPolygonGraphAndRerun(): Promise<void> {
   radiusBoundsSource = 'fixed'
   radiusBoundsCenter = undefined
   if (!await loadGraph(lastBounds, pointLocations)) return
-  setStatus(`Polygon loaded. Running ${algorithmInfo[currentAlgorithm()].title}…`)
+  setStatus(`Polygon loaded. Running ${algorithmInfo[currentAlgorithm()].title}…`, 'loading')
   await runCurrentAlgorithm()
 }
 
@@ -944,7 +975,7 @@ function validatePolygonForRun(): boolean {
   route = undefined
   renderer.setRoute(undefined)
   updateStats({})
-  setStatus('Self-intersecting polygon.')
+  setStatus('Self-intersecting polygon.', 'error')
   return false
 }
 
@@ -960,10 +991,14 @@ function clearCurrentAlgorithmResult(): void {
   clearRouteResult()
 }
 
-function beginWork(): WorkToken {
-  activeFetchController?.abort()
-  activeFetchController = new AbortController()
-  return { id: ++workSerial, signal: activeFetchController.signal }
+function beginGraphLoad(): GraphLoadToken {
+  activeGraphLoadController?.abort()
+  activeGraphLoadController = new AbortController()
+  return { id: ++graphLoadSerial, signal: activeGraphLoadController.signal }
+}
+
+function beginAlgorithmWork(): AlgorithmWorkToken {
+  return { id: ++algorithmWorkSerial }
 }
 
 function cancelPendingWork(): void {
@@ -972,12 +1007,17 @@ function cancelPendingWork(): void {
     pendingRerunTimer = undefined
   }
   pendingPointFinalizations.length = 0
-  activeFetchController?.abort()
-  workSerial++
+  activeGraphLoadController?.abort()
+  graphLoadSerial++
+  algorithmWorkSerial++
 }
 
-function isCurrentWork(work: WorkToken): boolean {
-  return work.id === workSerial && !work.signal.aborted
+function isCurrentGraphLoad(work: GraphLoadToken): boolean {
+  return work.id === graphLoadSerial && !work.signal.aborted
+}
+
+function isCurrentAlgorithmWork(work: AlgorithmWorkToken): boolean {
+  return work.id === algorithmWorkSerial
 }
 
 function redrawPolygonShapeOnly(): void {
@@ -1077,18 +1117,18 @@ async function reloadGraphForRadiusChange(): Promise<void> {
   if (!nextBounds) return
   if (lastBounds && boundsRoughlyEqual(nextBounds, lastBounds)) return
 
-  const work = beginWork()
+  const work = beginGraphLoad()
   const pointLocations = selectedPoints.map((point) => point.location)
   const tspStartIndex = selectedPoints.findIndex((point) => point.id === tspStartPointId)
   lastBounds = nextBounds
   updateUrl()
-  setStatus(`Refetching graph (${radiusMeters()} m)…`)
+  setStatus(`Refetching graph (${radiusMeters()} m)…`, 'loading')
   if (!await loadGraph(nextBounds, pointLocations, work)) return
-  if (!isCurrentWork(work)) return
+  if (!isCurrentGraphLoad(work)) return
   tspStartPointId = selectedPoints[tspStartIndex >= 0 ? tspStartIndex : 0]?.id
   renderPointList()
   if (selectedInputMode === 'polygon' && polygonPoints.length >= 3 && validatePolygonForRun()) {
-    await runCurrentAlgorithm(work)
+    await runCurrentAlgorithm()
     return
   }
   await rerunAfterSelectionEdit()
@@ -1104,7 +1144,7 @@ function currentProfile(): TransportProfile {
 
 async function setAlgorithm(algorithm: Algorithm, rerun = true): Promise<void> {
   if (algorithm === 'matching' && matchingNeedsEvenPoints()) {
-    setStatus(`Matching needs even count (${selectedPoints.length} points).`)
+    setStatus(`Matching needs even count (${selectedPoints.length} points).`, 'warn')
     return
   }
   if (algorithm !== selectedAlgorithm && graph) {
@@ -1113,7 +1153,7 @@ async function setAlgorithm(algorithm: Algorithm, rerun = true): Promise<void> {
       buildOperationCostContext(graph, selectedPoints.length),
     )
     if (algorithmExceedsBudget(operations)) {
-      setStatus(`${algorithmInfo[algorithm].title} over budget (~${formatOperations(operations)}).`)
+      setStatus(`${algorithmInfo[algorithm].title} over budget (~${formatOperations(operations)}).`, 'error')
       return
     }
   }
@@ -1149,9 +1189,9 @@ async function setAlgorithm(algorithm: Algorithm, rerun = true): Promise<void> {
   if (previousInputMode !== nextInputMode) {
     setStatus(nextInputMode === 'points'
       ? 'Points mode. Polygon cleared.'
-      : 'Polygon mode. Points cleared.')
+      : 'Polygon mode. Points cleared.', 'success')
   } else {
-    setStatus('Algorithm changed.')
+    setStatus('Algorithm changed.', 'success')
   }
   if (rerun) await rerunAfterSelectionEdit()
 }
@@ -1183,7 +1223,7 @@ async function setProfile(profile: TransportProfile, reload = true): Promise<voi
 function setInputMode(mode: InputMode, announce = true, clearOnChange = true): void {
   const changed = selectedInputMode !== mode
   selectedInputMode = mode
-  if (mode === 'points' && !algorithmNeedsPoints(currentAlgorithm())) selectedAlgorithm = 'mst'
+  if (mode === 'points' && !algorithmNeedsPoints(currentAlgorithm())) selectedAlgorithm = 'tspPath'
   if (mode === 'polygon' && algorithmNeedsPoints(currentAlgorithm())) selectedAlgorithm = 'postman'
   updateAlgorithmCards()
   for (const button of inputChoices.querySelectorAll<HTMLButtonElement>('[data-input-mode]')) {
@@ -1194,9 +1234,7 @@ function setInputMode(mode: InputMode, announce = true, clearOnChange = true): v
   updateAlgorithmInfo()
   updateUrl()
   if (!announce) return
-  setStatus(mode === 'polygon'
-    ? 'Polygon mode.'
-    : 'Points mode.')
+  setStatus(mode === 'polygon' ? 'Polygon mode.' : 'Points mode.', 'success')
 }
 
 function updateAlgorithmCards(): void {
@@ -1283,7 +1321,7 @@ function clearSelection(announce = true): void {
   renderPolygon()
   clearCurrentAlgorithmResult()
   updateUrl()
-  if (announce) setStatus('Selection cleared.')
+  if (announce) setStatus('Selection cleared.', 'idle')
 }
 
 function clearLoadedGraph(announce = true): void {
@@ -1298,7 +1336,7 @@ function clearLoadedGraph(announce = true): void {
   updateOperationEstimates()
   updateUrl()
   if (announce) {
-    setStatus('Graph and selection cleared.')
+    setStatus('Graph and selection cleared.', 'idle')
   }
 }
 
@@ -1306,8 +1344,33 @@ function matchingNeedsEvenPoints(): boolean {
   return selectedPoints.length > 0 && selectedPoints.length % 2 === 1
 }
 
-function setStatus(message: string): void {
+function setStatus(message: string, tone: StatusTone = inferStatusTone(message)): void {
   statusEl.textContent = message
+  statusEl.dataset.tone = tone
+  statusEl.closest('.panel-status')?.setAttribute('data-tone', tone)
+}
+
+type StatusTone = 'idle' | 'loading' | 'success' | 'error' | 'warn'
+
+function inferStatusTone(message: string): StatusTone {
+  const lower = message.toLowerCase()
+  if (lower.includes('loading graph') || lower.includes('refetching') || lower.startsWith('running ')
+    || lower.includes('. running ') || lower.endsWith('…')) {
+    return 'loading'
+  }
+  if (lower.includes('failed') || lower.includes('could not') || lower.includes('self-intersecting')
+    || lower.includes('over budget')) {
+    return 'error'
+  }
+  if (lower.includes('need ') || lower.includes('click map to place') || lower.includes('load a graph')
+    || lower.includes('no saved') || lower.includes('no valid') || lower.includes('before importing')
+    || lower.includes('matching needs')) {
+    return 'warn'
+  }
+  if (lower.includes('cleared') || lower.startsWith('click map to load')) {
+    return 'idle'
+  }
+  return 'success'
 }
 
 function humanize(value: string): string {
@@ -1318,8 +1381,13 @@ function boundsContains(bounds: Bounds, point: LatLng): boolean {
   return point.lat >= bounds.south && point.lat <= bounds.north && point.lon >= bounds.west && point.lon <= bounds.east
 }
 
+function pointLabel(index: number): string {
+  if (index < 26) return String.fromCharCode(65 + index)
+  return String(index + 1)
+}
+
 function relabel(points: PointSelection[]): PointSelection[] {
-  return points.map((point, index) => ({ ...point, label: String.fromCharCode(65 + index) }))
+  return points.map((point, index) => ({ ...point, label: pointLabel(index) }))
 }
 
 function updateUrl(): void {
@@ -1363,6 +1431,7 @@ async function restoreFromUrl(): Promise<void> {
     const tspStartIndex = Number(params.get('tspStart') ?? 0)
     tspStartPointId = selectedPoints[tspStartIndex]?.id ?? selectedPoints[0]?.id
     renderPointList()
+    await rerunAfterSelectionEdit()
   }
   updateAlgorithmInfo()
 }
@@ -1385,13 +1454,13 @@ function saveExperiment(): void {
   }
   const experiments = readExperiments()
   localStorage.setItem('experiments', JSON.stringify([experiment, ...experiments].slice(0, 30)))
-  setStatus(`Saved experiment "${name}".`)
+  setStatus(`Saved experiment "${name}".`, 'success')
 }
 
 async function loadExperiment(): Promise<void> {
   const experiments = readExperiments()
   if (!experiments.length) {
-    setStatus('No saved experiments yet.')
+    setStatus('No saved experiments yet.', 'warn')
     return
   }
   const list = experiments.map((experiment, index) => `${index + 1}. ${experiment.name}`).join('\n')
@@ -1420,15 +1489,16 @@ async function loadExperiment(): Promise<void> {
     for (const point of experiment.points) addPoint(point)
     tspStartPointId = selectedPoints[experiment.tspStartIndex ?? 0]?.id ?? selectedPoints[0]?.id
     renderPointList()
+    await rerunAfterSelectionEdit()
   }
   updateAlgorithmInfo()
-  setStatus(`Loaded experiment "${experiment.name}".`)
+  setStatus(`Loaded experiment "${experiment.name}".`, 'success')
 }
 
 function shareCurrentUrl(): void {
   updateUrl()
   void navigator.clipboard?.writeText(location.href)
-  setStatus('Share URL copied to clipboard.')
+  setStatus('Share URL copied to clipboard.', 'success')
 }
 
 function exportPoints(): void {
@@ -1445,21 +1515,22 @@ function exportPoints(): void {
 
 async function importPoints(): Promise<void> {
   if (!graph || !lastBounds) {
-    setStatus('Load a graph before importing points.')
+    setStatus('Load a graph before importing points.', 'warn')
     return
   }
   const raw = prompt('Paste GeoJSON FeatureCollection, or one "lat,lon" point per line.')
   if (!raw) return
   const points = parseImportedPoints(raw)
   if (!points.length) {
-    setStatus('No valid points found.')
+    setStatus('No valid points found.', 'warn')
     return
   }
   selectedPoints = []
   tspStartPointId = undefined
   renderer.setPoints(selectedPoints)
   for (const point of points) addPoint(point)
-  setStatus(`Imported ${points.length} points.`)
+  await rerunAfterSelectionEdit()
+  setStatus(`Imported ${points.length} points.`, 'success')
 }
 
 function readExperiments(): SavedExperiment[] {

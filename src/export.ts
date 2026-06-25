@@ -1,7 +1,9 @@
+import { routePathForElevation } from './elevation'
 import type { RouteResult } from './types'
 
 export function routeToGpx(route: RouteResult): string {
-  const points = route.path.map((point) => `      <trkpt lat="${point.lat}" lon="${point.lon}"></trkpt>`).join('\n')
+  const path = routePathForElevation(route)
+  const points = path.map((point) => `      <trkpt lat="${point.lat}" lon="${point.lon}"></trkpt>`).join('\n')
   return `<?xml version="1.0" encoding="UTF-8"?>
 <gpx version="1.1" creator="OSM Postman" xmlns="http://www.topografix.com/GPX/1/1">
   <trk>
@@ -15,6 +17,7 @@ ${points}
 }
 
 export function routeToGeoJson(route: RouteResult): string {
+  const path = routePathForElevation(route)
   return JSON.stringify({
     type: 'FeatureCollection',
     features: [
@@ -27,7 +30,7 @@ export function routeToGeoJson(route: RouteResult): string {
         },
         geometry: {
           type: 'LineString',
-          coordinates: route.path.map((point) => [point.lon, point.lat]),
+          coordinates: path.map((point) => [point.lon, point.lat]),
         },
       },
     ],

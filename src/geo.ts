@@ -1,4 +1,4 @@
-import type { Bounds, LatLng } from './types'
+import type { Bounds, GraphEdge, LatLng } from './types'
 
 const EARTH_RADIUS_M = 6371008.8
 
@@ -133,4 +133,13 @@ function onSegment(a: LatLng, b: LatLng, c: LatLng): boolean {
     && b.lon <= Math.max(a.lon, c.lon) + 1e-12
     && b.lat >= Math.min(a.lat, c.lat) - 1e-12
     && b.lat <= Math.max(a.lat, c.lat) + 1e-12
+}
+
+export function edgeCollectionToPath(edges: GraphEdge[]): LatLng[] {
+  const path: LatLng[] = []
+  for (const edge of edges) {
+    if (path.length === 0) path.push(...edge.geometry)
+    else path.push(...edge.geometry.slice(1))
+  }
+  return path
 }

@@ -104,7 +104,10 @@ export function largestConnectedComponent(graph: StreetGraph): StreetGraph {
   const edges: GraphEdge[] = []
   for (const edge of graph.edges) {
     if (!keep.has(edge.u) || !keep.has(edge.v)) continue
-    edges.push({ ...edge, id: edges.length, u: remap.get(edge.u) ?? 0, v: remap.get(edge.v) ?? 0 })
+    const u = remap.get(edge.u)
+    const v = remap.get(edge.v)
+    if (u === undefined || v === undefined) continue
+    edges.push({ ...edge, id: edges.length, u, v })
   }
   return makeGraph(nodes, edges, graph.profile)
 }
@@ -127,16 +130,17 @@ export function clipGraphToPolygon(graph: StreetGraph, polygon: LatLng[]): Stree
     remap.set(oldId, id)
     return { ...graph.nodes[oldId], id }
   })
-  const remappedEdges = edges.map((edge, id) => ({
-    ...edge,
-    id,
-    u: remap.get(edge.u) ?? 0,
-    v: remap.get(edge.v) ?? 0,
-  }))
+  const remappedEdges = edges.flatMap((edge, id) => {
+    const u = remap.get(edge.u)
+    const v = remap.get(edge.v)
+    if (u === undefined || v === undefined) return []
+    return [{ ...edge, id, u, v }]
+  })
   return largestConnectedComponent(makeGraph(nodes, remappedEdges, graph.profile))
 }
 
 export function nearestNode(graph: StreetGraph, point: LatLng): number {
+  if (!graph.nodes.length) throw new Error('Graph has no nodes.')
   let best = 0
   let bestDist = Infinity
   for (const node of graph.nodes) {
@@ -155,8 +159,24 @@ export function addSnappedPoint(graph: StreetGraph, point: LatLng): {
   location: LatLng
   distance: number
 } {
+  if (!graph.edges.length) {
+    if (!graph.nodes.length) {
+      return { graph, nodeId: -1, location: point, distance: Infinity }
+    }
+    const nodeId = nearestNode(graph, point)
+    const node = graph.nodes[nodeId]
+    return {
+      graph,
+      nodeId,
+      location: { lat: node.lat, lon: node.lon },
+      distance: haversineMeters(point, node),
+    }
+  }
   const snap = nearestPointOnGraph(graph, point)
   const original = graph.edges[snap.edgeId]
+  if (!original) {
+    return { graph, nodeId: -1, location: point, distance: Infinity }
+  }
   const nearU = haversineMeters(graph.nodes[original.u], snap.location)
   const nearV = haversineMeters(graph.nodes[original.v], snap.location)
   if (nearU < 0.5) return { graph, nodeId: original.u, location: graph.nodes[original.u], distance: snap.distance }

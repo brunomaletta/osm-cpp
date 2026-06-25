@@ -4,7 +4,7 @@ import { completeGraphMst } from './algorithms/mst'
 import { minPerfectMatchingBlossom } from './algorithms/matching'
 import { solveTsp } from './algorithms/tsp'
 import { solveSteinerTree } from './algorithms/steinerTree'
-import { formatDistance } from './geo'
+import { formatDistance, edgeCollectionToPath } from './geo'
 import { edgeGeometryInDirection } from './graph'
 
 export type PointAlgorithm = 'mst' | 'tsp' | 'tspPath' | 'matching' | 'steiner'
@@ -145,15 +145,6 @@ export function algorithmNeedsPoints(algorithm: string): boolean {
 
 export function routeEdgesFromIds(graph: StreetGraph, edgeIds: number[]): GraphEdge[] {
   return edgeIds.map((id) => graph.edges[id]).filter(Boolean)
-}
-
-function edgeCollectionToPath(edges: GraphEdge[]): LatLng[] {
-  const path: LatLng[] = []
-  for (const edge of edges) {
-    if (path.length === 0) path.push(...edge.geometry)
-    else path.push(...edge.geometry.slice(1))
-  }
-  return path
 }
 
 function metricRouteToPath(

@@ -1,5 +1,5 @@
 import L from 'leaflet'
-import type { GraphEdge, LatLng, PointSelection, RouteResult, StreetGraph } from './types'
+import type { LatLng, PointSelection, RouteResult, StreetGraph } from './types'
 import { formatDistance } from './geo'
 
 export type RenderController = {
@@ -193,14 +193,7 @@ function lerpColor(a: string, b: string, t: number): string {
   return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${bl.toString(16).padStart(2, '0')}`
 }
 
-export function edgeCollectionToPath(edges: GraphEdge[]): LatLng[] {
-  const path: LatLng[] = []
-  for (const edge of edges) {
-    if (path.length === 0) path.push(...edge.geometry)
-    else path.push(...edge.geometry.slice(1))
-  }
-  return path
-}
+export { edgeCollectionToPath } from './geo'
 
 export function routeSummary(route: RouteResult): string {
   return `${route.name}: ${formatDistance(route.distance)}`

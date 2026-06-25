@@ -1,5 +1,5 @@
-import { haversineMeters, polylineLength } from './geo'
-import type { GraphEdge, LatLng, RouteResult, StreetGraph } from './types'
+import { haversineMeters, polylineLength, edgeCollectionToPath } from './geo'
+import type { LatLng, RouteResult, StreetGraph } from './types'
 
 type ElevationSample = {
   gainM: number
@@ -15,15 +15,6 @@ export function routePathForElevation(route: RouteResult): LatLng[] {
   if (route.path.length >= 2) return route.path
   if (route.edges.length > 0) return edgeCollectionToPath(route.edges)
   return []
-}
-
-function edgeCollectionToPath(edges: GraphEdge[]): LatLng[] {
-  const path: LatLng[] = []
-  for (const edge of edges) {
-    if (path.length === 0) path.push(...edge.geometry)
-    else path.push(...edge.geometry.slice(1))
-  }
-  return path
 }
 
 export function elevationStatsForRoute(
@@ -56,7 +47,7 @@ export async function enrichElevationStats(
 
   try {
     const elevations = await fetchDemElevations(samples, signal)
-    if (elevations.length < 2) return graphStats
+    if (!elevations || elevations.length < 2) return graphStats
 
     const fromDem = measureSequentialElevations(elevations)
     const demStats = formatElevationStats(fromDem, distanceM)
@@ -211,22 +202,24 @@ function samplePath(path: LatLng[], maxSamples: number): LatLng[] {
   return samples
 }
 
-async function fetchDemElevations(points: LatLng[], signal?: AbortSignal): Promise<number[]> {
+async function fetchDemElevations(points: LatLng[], signal?: AbortSignal): Promise<number[] | undefined> {
   const elevations: number[] = []
   const chunkSize = 90
   for (let start = 0; start < points.length; start += chunkSize) {
     const chunk = points.slice(start, start + chunkSize)
     const locations = chunk.map((point) => `${point.lat},${point.lon}`).join('|')
     const response = await fetch(`${DEM_ENDPOINT}?locations=${encodeURIComponent(locations)}`, { signal })
-    if (!response.ok) continue
+    if (!response.ok) return undefined
     const payload = await response.json() as {
       status?: string
       results?: Array<{ elevation: number | null; location?: { lat: number; lng: number } }>
     }
-    if (payload.status && payload.status !== 'OK') continue
-    elevations.push(...parseDemElevationResults(payload))
+    if (payload.status && payload.status !== 'OK') return undefined
+    const chunkElevations = parseDemElevationResults(payload)
+    if (chunkElevations.length !== chunk.length) return undefined
+    elevations.push(...chunkElevations)
   }
-  return elevations
+  return elevations.length === points.length ? elevations : undefined
 }
 
 function locationKey(point: LatLng): string {
