@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest'
-import { addSnappedPoint, makeGraph } from './graph'
+import { addSnappedPoint, buildStreetGraph, makeGraph, mergeStreetGraphs, terminalsConnected as graphTerminalsConnected } from './graph'
 import { isSimplePolygon } from './geo'
 import { solveChinesePostman } from './chinesePostman'
 import { minPerfectMatching } from './algorithms/matching'
@@ -45,6 +45,66 @@ describe('point snapping', () => {
     expect(result.nodeId).toBe(2)
     expect(result.graph.edges).toHaveLength(2)
     expect(result.graph.edges.every((edge) => edge.u === 2 || edge.v === 2)).toBe(true)
+  })
+})
+
+describe('graph merge', () => {
+  test('builds from Overpass out geom ways', () => {
+    const graph = buildStreetGraph([
+      {
+        type: 'way',
+        id: 42,
+        nodes: [10, 11],
+        geometry: [{ lat: 0, lon: 0 }, { lat: 0.001, lon: 0 }],
+        tags: { highway: 'footway' },
+      },
+    ], 'pedestrian')
+    expect(graph.nodes).toHaveLength(2)
+    expect(graph.edges).toHaveLength(1)
+    expect(graph.edges[0]?.length).toBeGreaterThan(0)
+  })
+
+  test('concatenates disconnected components without dropping either side', () => {
+    const left = fixtureGraph(2, [[0, 1, 10]])
+    const right = makeGraph(
+      [{ id: 0, lat: 1, lon: 1 }, { id: 1, lat: 1.001, lon: 1 }],
+      [{ id: 0, u: 0, v: 1, length: 20, geometry: [{ lat: 1, lon: 1 }, { lat: 1.001, lon: 1 }] }],
+      'pedestrian',
+    )
+    const merged = mergeStreetGraphs(left, right)
+    expect(merged.nodes).toHaveLength(4)
+    expect(merged.edges).toHaveLength(2)
+    expect(merged.adjacency[0]).toHaveLength(1)
+    expect(merged.adjacency[2]).toHaveLength(1)
+  })
+
+  test('welds overlapping OSM nodes when merging patches', () => {
+    const left = makeGraph(
+      [{ id: 0, osmId: 10, lat: 0, lon: 0 }, { id: 1, osmId: 11, lat: 0.001, lon: 0 }],
+      [{ id: 0, u: 0, v: 1, length: 10, geometry: [{ lat: 0, lon: 0 }, { lat: 0.001, lon: 0 }], osmWayId: 100 }],
+      'pedestrian',
+    )
+    const right = makeGraph(
+      [{ id: 0, osmId: 11, lat: 0.001, lon: 0 }, { id: 1, osmId: 12, lat: 0.002, lon: 0 }],
+      [{ id: 0, u: 0, v: 1, length: 10, geometry: [{ lat: 0.001, lon: 0 }, { lat: 0.002, lon: 0 }], osmWayId: 101 }],
+      'pedestrian',
+    )
+    const merged = mergeStreetGraphs(left, right)
+    expect(merged.nodes).toHaveLength(3)
+    expect(merged.edges).toHaveLength(2)
+    expect(graphTerminalsConnected(merged, [0, 2])).toBe(true)
+  })
+
+  test('keeps merged components disconnected until bridged', () => {
+    const left = fixtureGraph(2, [[0, 1, 10]])
+    const right = makeGraph(
+      [{ id: 0, lat: 1, lon: 1 }, { id: 1, lat: 1.001, lon: 1 }],
+      [{ id: 0, u: 0, v: 1, length: 20, geometry: [{ lat: 1, lon: 1 }, { lat: 1.001, lon: 1 }] }],
+      'pedestrian',
+    )
+    const merged = mergeStreetGraphs(left, right)
+    expect(graphTerminalsConnected(merged, [0, 3])).toBe(false)
+    expect(graphTerminalsConnected(merged, [0, 1])).toBe(true)
   })
 })
 

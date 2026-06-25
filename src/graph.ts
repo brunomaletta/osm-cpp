@@ -14,13 +14,20 @@ export type OsmWay = {
   id: number
   nodes: number[]
   tags?: Record<string, string>
+  geometry?: Array<{ lat: number; lon: number }>
 }
 
 export type OsmElement = OsmNode | OsmWay
 
+export type BuildStreetGraphOptions = {
+  /** When false, keep every street component in the bbox (needed for patch merge). */
+  connectedOnly?: boolean
+}
+
 export function buildStreetGraph(
   elements: OsmElement[],
   profile: TransportProfile,
+  options: BuildStreetGraphOptions = {},
 ): StreetGraph {
   const osmNodes = new Map<number, OsmNode>()
   const ways: OsmWay[] = []
@@ -32,6 +39,22 @@ export function buildStreetGraph(
   const nodes: GraphNode[] = []
   const nodeByOsm = new Map<number, number>()
   const edges: GraphEdge[] = []
+
+  function getOrCreateNode(osmId: number | undefined, coord: { lat: number; lon: number }): number {
+    if (osmId !== undefined) {
+      const existing = nodeByOsm.get(osmId)
+      if (existing !== undefined) return existing
+      const known = osmNodes.get(osmId)
+      const id = nodes.length
+      const ele = parseElevation(known?.tags?.ele)
+      nodes.push({ id, osmId, lat: known?.lat ?? coord.lat, lon: known?.lon ?? coord.lon, ele })
+      nodeByOsm.set(osmId, id)
+      return id
+    }
+    const id = nodes.length
+    nodes.push({ id, lat: coord.lat, lon: coord.lon })
+    return id
+  }
 
   function getNode(osmId: number): number | undefined {
     const existing = nodeByOsm.get(osmId)
@@ -46,6 +69,23 @@ export function buildStreetGraph(
   }
 
   for (const way of ways) {
+    if (way.geometry && way.geometry.length >= 2) {
+      for (let i = 1; i < way.geometry.length; i++) {
+        const osmU = way.nodes[i - 1]
+        const osmV = way.nodes[i]
+        const coordU = way.geometry[i - 1]!
+        const coordV = way.geometry[i]!
+        const u = getOrCreateNode(osmU, coordU)
+        const v = getOrCreateNode(osmV, coordV)
+        if (u === v) continue
+        const geometry = [nodes[u], nodes[v]].map(({ lat, lon }) => ({ lat, lon }))
+        const length = polylineLength(geometry)
+        if (length <= 0) continue
+        edges.push({ id: edges.length, u, v, length, geometry, osmWayId: way.id, tags: way.tags, oneWay: isOneWay(way) })
+      }
+      continue
+    }
+
     for (let i = 1; i < way.nodes.length; i++) {
       const u = getNode(way.nodes[i - 1])
       const v = getNode(way.nodes[i])
@@ -57,7 +97,85 @@ export function buildStreetGraph(
     }
   }
 
-  return largestConnectedComponent(makeGraph(nodes, edges, profile))
+  const graph = makeGraph(nodes, edges, profile)
+  return options.connectedOnly === false ? graph : largestConnectedComponent(graph)
+}
+
+export function mergeStreetGraphs(base: StreetGraph, patch: StreetGraph): StreetGraph {
+  if (base.profile !== patch.profile) return patch
+
+  const osmToNode = new Map<number, number>()
+  for (const node of base.nodes) {
+    if (node.osmId !== undefined) osmToNode.set(node.osmId, node.id)
+  }
+
+  const patchToMerged = new Map<number, number>()
+  const nodes = [...base.nodes]
+
+  for (const patchNode of patch.nodes) {
+    if (patchNode.osmId !== undefined) {
+      const existing = osmToNode.get(patchNode.osmId)
+      if (existing !== undefined) {
+        patchToMerged.set(patchNode.id, existing)
+        continue
+      }
+    }
+    const mergedId = nodes.length
+    patchToMerged.set(patchNode.id, mergedId)
+    nodes.push({ ...patchNode, id: mergedId })
+    if (patchNode.osmId !== undefined) osmToNode.set(patchNode.osmId, mergedId)
+  }
+
+  const edges = [...base.edges]
+  const seenEdge = new Set(base.edges.map((edge) => edgeDedupKey(edge.u, edge.v, edge.osmWayId)))
+
+  for (const edge of patch.edges) {
+    const u = patchToMerged.get(edge.u)
+    const v = patchToMerged.get(edge.v)
+    if (u === undefined || v === undefined || u === v) continue
+    const key = edgeDedupKey(u, v, edge.osmWayId)
+    if (seenEdge.has(key)) continue
+    seenEdge.add(key)
+    edges.push({ ...edge, id: edges.length, u, v })
+  }
+
+  return makeGraph(nodes, edges, base.profile)
+}
+
+function edgeDedupKey(u: number, v: number, osmWayId?: number): string {
+  const a = Math.min(u, v)
+  const b = Math.max(u, v)
+  return `${a}:${b}:${osmWayId ?? 'x'}`
+}
+
+export function computeComponentIds(graph: StreetGraph): number[] {
+  const component = Array(graph.nodes.length).fill(-1)
+  let componentId = 0
+  for (let start = 0; start < graph.nodes.length; start++) {
+    if (component[start] !== -1) continue
+    const stack = [start]
+    component[start] = componentId
+    while (stack.length) {
+      const node = stack.pop()
+      if (node === undefined) continue
+      for (const edge of graph.adjacency[node]) {
+        if (component[edge.to] === -1) {
+          component[edge.to] = componentId
+          stack.push(edge.to)
+        }
+      }
+    }
+    componentId++
+  }
+  return component
+}
+
+export function terminalsConnected(graph: StreetGraph, terminalIds: number[]): boolean {
+  if (terminalIds.length < 2) return true
+  const component = computeComponentIds(graph)
+  const first = component[terminalIds[0]]
+  if (first === undefined || first < 0) return false
+  return terminalIds.every((nodeId) => component[nodeId] === first)
 }
 
 export function makeGraph(nodes: GraphNode[], edges: GraphEdge[], profile: TransportProfile = 'pedestrian'): StreetGraph {

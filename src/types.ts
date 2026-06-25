@@ -10,6 +10,12 @@ export type Bounds = {
   east: number
 }
 
+/** Overpass fetch area: bbox always; optional convex hull when it shrinks the query. */
+export type OsmFetchRegion = {
+  bounds: Bounds
+  polygon?: LatLng[]
+}
+
 export type TransportProfile = 'pedestrian' | 'car'
 
 export type GraphNode = LatLng & {

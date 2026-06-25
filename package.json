@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "vitest run --pool=threads"
+    "test": "vitest run --pool=threads",
+    "logs": "curl -s http://localhost:5173/__osm-postman/logs || cat logs/osm-postman-client.log 2>/dev/null || echo 'No logs yet — run npm run dev and use the app'"
   },
   "devDependencies": {
     "typescript": "~6.0.2",

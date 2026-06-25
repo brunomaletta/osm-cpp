@@ -17,9 +17,15 @@ export function runPointAlgorithm(
 ): RouteResult {
   if (points.length < 2) throw new Error('Add at least two points first.')
   const terminals = points.map((point) => point.snappedNode)
+  if (terminals.some((nodeId) => nodeId < 0 || nodeId >= graph.nodes.length)) {
+    throw new Error('Points are still being placed on the graph.')
+  }
   const clickedLocations = points.map((point) => point.location)
   const maxSnapDistance = Math.max(...points.map((point) => point.snapDistance))
   const closure = buildMetricClosure(graph, terminals)
+  if (!metricClosureConnected(closure.distances)) {
+    throw new Error('Some points are not connected by walkable roads. Try moving points closer or increasing radius.')
+  }
 
   if (algorithm === 'mst') {
     const result = completeGraphMst(closure.distances)
@@ -76,6 +82,15 @@ export function runPointAlgorithm(
       : 'Metric-closure MST approximation after Dijkstra preprocessing.',
     approximation: result.exact ? 'Exact for this terminal count.' : '2-approximation for metric Steiner tree style closure.',
   })
+}
+
+function metricClosureConnected(distances: number[][]): boolean {
+  for (let i = 0; i < distances.length; i++) {
+    for (let j = i + 1; j < distances.length; j++) {
+      if (!Number.isFinite(distances[i][j])) return false
+    }
+  }
+  return true
 }
 
 function matchingResult(
