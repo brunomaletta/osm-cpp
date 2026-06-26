@@ -7,14 +7,13 @@ import {
   convexHull,
   fetchRegionFromPointSet,
   elongatedCorridorRegion,
-  padBounds,
-  boundsFromPoints,
   boundsSpanMeters,
   shouldPreferPatchBridgeLoad,
   pointSetSpanMeters,
   isElongatedPointSet,
   snapCoverageLimitMeters,
   describeFetchRegionArea,
+  haversineMeters,
 } from './geo'
 
 describe('convex hull fetch regions', () => {
@@ -62,7 +61,7 @@ describe('convex hull fetch regions', () => {
     expect(region.polygon).toBeUndefined()
   })
 
-  test('spread collinear layout uses thin corridor bbox', () => {
+  test('spread collinear layout uses widened corridor bbox', () => {
     const points = [
       { lat: -20.088, lon: -43.984 },
       { lat: -20.095, lon: -43.9842 },
@@ -72,8 +71,19 @@ describe('convex hull fetch regions', () => {
     const region = elongatedCorridorRegion(points, 350)
     const bbox = fetchRegionFromPointSet(points, 350)
     expect(region.bounds).toEqual(bbox.bounds)
-    const giant = padBounds(boundsFromPoints(points), 950)
-    expect(approxBoundsAreaSqMeters(region.bounds)).toBeLessThan(approxBoundsAreaSqMeters(giant) * 0.4)
+    const centerLat = (region.bounds.south + region.bounds.north) / 2
+    const width = haversineMeters(
+      { lat: centerLat, lon: region.bounds.west },
+      { lat: centerLat, lon: region.bounds.east },
+    )
+    expect(width).toBeGreaterThan(700)
+    const thin = elongatedCorridorRegion(
+      [{ lat: -20.088, lon: -43.984 }, { lat: -20.103, lon: -43.984 }],
+      350,
+    )
+    expect(approxBoundsAreaSqMeters(region.bounds)).toBeGreaterThanOrEqual(
+      approxBoundsAreaSqMeters(thin.bounds),
+    )
   })
 
   test('urban trapezoid spread uses bulk bbox not patch-bridge', () => {

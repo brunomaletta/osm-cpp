@@ -216,7 +216,8 @@ export function elongatedCorridorRegion(points: LatLng[], paddingMeters: number)
   }
   if (isCollinearSet(points)) {
     const [a, b] = farthestPair(points)
-    return { bounds: boundsAroundSegment(a, b, paddingMeters) }
+    const halfWidth = bridgeCorridorHalfWidth(a, b, paddingMeters)
+    return { bounds: boundsAroundSegment(a, b, halfWidth) }
   }
   const ordered = orderPointsAlongAxis(points)
   const start = ordered[0]!
@@ -277,7 +278,8 @@ export function fetchRegionFromPointSet(points: LatLng[], paddingMeters: number)
 
   if (points.length === 2 || isCollinearSet(points)) {
     const [a, b] = farthestPair(points)
-    return { bounds: boundsAroundSegment(a, b, paddingMeters) }
+    const halfWidth = bridgeCorridorHalfWidth(a, b, paddingMeters)
+    return { bounds: boundsAroundSegment(a, b, halfWidth) }
   }
 
   const paddedBbox = padBounds(boundsFromPoints(points), paddingMeters)

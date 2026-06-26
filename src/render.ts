@@ -104,7 +104,8 @@ export function createRenderController(
   function setPoints(points: PointSelection[]) {
     pointLayer.clearLayers()
     for (const point of points) {
-      if (point.snapDistance > 0.5) {
+      const pending = point.snappedNode < 0
+      if (!pending && point.snapDistance > 0.5) {
         L.polyline(toLeaflet([point.location, point.snappedLocation]), {
           color: RESULT_EDGE_COLOR,
           opacity: 0.95,
@@ -124,10 +125,12 @@ export function createRenderController(
       }
       const marker = L.marker([point.location.lat, point.location.lon], {
         draggable: true,
-        title: `Point ${point.label}`,
+        title: pending ? `Point ${point.label} (pending)` : `Point ${point.label}`,
         icon: L.divIcon({
           className: 'point-handle',
-          html: `<span>${point.label}</span>`,
+          html: pending
+            ? `<span class="point-handle-pending-inner">${point.label}</span>`
+            : `<span>${point.label}</span>`,
           iconSize: [34, 34],
           iconAnchor: [17, 17],
         }),

@@ -10,7 +10,7 @@ import {
   nearestPointOnGraph,
   terminalsConnected,
 } from './graph'
-import { boundsFromCenter, boundsFromPoints, boundsSpanMeters, bridgeCorridorHalfWidth, bridgeFetchBounds, corridorBoundsChunks, describeFetchRegionArea, elongatedCorridorRegion, fetchRegionFromPointSet, haversineMeters, isElongatedPointSet, isSimplePolygon, orderPointsAlongAxis, padBounds, pointSetSpanMeters, snapCoverageLimitMeters, unionBounds, asFetchRegion } from './geo'
+import { boundsFromCenter, boundsFromPoints, boundsSpanMeters, bridgeCorridorHalfWidth, bridgeFetchBounds, corridorBoundsChunks, describeFetchRegionArea, elongatedCorridorRegion, fetchRegionFromPointSet, haversineMeters, isElongatedPointSet, isSimplePolygon, orderPointsAlongAxis, padBounds, pointSetSpanMeters, shouldPreferPatchBridgeLoad, snapCoverageLimitMeters, unionBounds, asFetchRegion } from './geo'
 import { solveChinesePostman } from './chinesePostman'
 import { fetchOsmGraph, profileCaveat } from './osm'
 import { createRenderController, routeSummary } from './render'
@@ -255,6 +255,7 @@ let algorithmWorkSerial = 0
 let pendingRerunTimer: number | undefined
 const pendingPointFinalizations: Array<{ id: string; location: LatLng }> = []
 let drainingPointFinalizations = false
+let pointFinalizationDrain: Promise<void> | undefined
 let graphLoadAbortRetries = 0
 let graphLoadFatalError = false
 let pointExpansionFlight: Promise<boolean | 'aborted' | 'deferred'> | undefined
@@ -667,9 +668,7 @@ function addProvisionalPoint(location: LatLng): PointSelection {
   renderer.setPoints(selectedPoints)
   renderPointList()
   updateUrl()
-  if (!drainingPointFinalizations && !graphLoadQueue.isInFlight()) {
-    setStatus(`Point ${point.label} (${selectedPoints.length})`, 'loading')
-  }
+  setStatus(`Point ${point.label} (${selectedPoints.length})`, 'loading')
   return point
 }
 
@@ -679,7 +678,6 @@ async function finalizePendingPoints(batch: Array<{ id: string; location: LatLng
   const coalesced = new Map<string, LatLng>()
   for (const entry of batch) coalesced.set(entry.id, entry.location)
   for (const entry of pendingPointFinalizations) coalesced.set(entry.id, entry.location)
-  pendingPointFinalizations.length = 0
   for (const point of selectedPoints) {
     if (point.snappedNode < 0) coalesced.set(point.id, point.location)
   }
@@ -696,7 +694,7 @@ async function finalizePendingPoints(batch: Array<{ id: string; location: LatLng
     queueInFlight: graphLoadQueue.isInFlight(),
   })
 
-  const coverage = await ensureGraphCoversPoints()
+  const coverage = await ensureGraphCoversPoints({ skipPlacementWait: true })
   debugLog('points', 'finalize:coverage', coverage)
 
   if (!coverage.ok) {
@@ -706,7 +704,7 @@ async function finalizePendingPoints(batch: Array<{ id: string; location: LatLng
       if (graphLoadFatalError || graphLoadAbortRetries >= MAX_GRAPH_LOAD_ABORT_RETRIES) {
         failPendingPointFinalizations(pending, graphLoadFatalError
           ? 'Graph load timed out. Try again or use a smaller area.'
-          : 'Graph load timed out. Try again.')
+          : 'Graph load timed out. Try again.', graphLoadFatalError)
         return
       }
       pendingPointFinalizations.unshift(...pending)
@@ -737,20 +735,22 @@ async function finalizePendingPoints(batch: Array<{ id: string; location: LatLng
   }
 
   const locations = new Map(pending.map((point) => [point.id, point.location]))
-  let workingGraph = graph
+  const pendingIds = new Set(pending.map((point) => point.id))
   selectedPoints = selectedPoints.map((point) => {
     const location = locations.get(point.id) ?? point.location
-    const snap = addSnappedPoint(workingGraph, location)
-    workingGraph = snap.graph
+    if (!pendingIds.has(point.id)) {
+      return location === point.location ? point : { ...point, location }
+    }
     return {
       ...point,
       location,
-      snappedLocation: snap.location,
-      snappedNode: snap.nodeId,
-      snapDistance: snap.distance,
+      snappedLocation: location,
+      snappedNode: -1,
+      snapDistance: 0,
     }
   })
-  graph = workingGraph
+  resnapPointsByIds(pendingIds)
+  pendingPointFinalizations.length = 0
   renderer.setGraph(graph)
   renderer.setPoints(selectedPoints)
   renderPointList()
@@ -827,26 +827,48 @@ async function waitForDrainBatchReady(): Promise<void> {
 async function drainPointFinalizations(): Promise<void> {
   if (drainingPointFinalizations) {
     debugLog('points', 'drain:skip-already-draining', { queued: pendingPointFinalizations.length })
-    return
+    return pointFinalizationDrain ?? Promise.resolve()
   }
   drainingPointFinalizations = true
   debugLog('points', 'drain:start', { queued: pendingPointFinalizations.length })
-  try {
-    while (pendingPointFinalizations.length && !graphLoadFatalError) {
-      await waitForDrainBatchReady()
-      if (!pendingPointFinalizations.length || graphLoadFatalError) break
-      const batch = pendingPointFinalizations.splice(0, pendingPointFinalizations.length)
-      debugLog('points', 'drain:batch', { batch: batch.length, remaining: pendingPointFinalizations.length })
-      await finalizePendingPoints(batch)
+  pointFinalizationDrain = (async () => {
+    try {
+      while (pendingPointFinalizations.length && !graphLoadFatalError) {
+        await waitForDrainBatchReady()
+        if (!pendingPointFinalizations.length || graphLoadFatalError) break
+        const batch = pendingPointFinalizations.splice(0, pendingPointFinalizations.length)
+        debugLog('points', 'drain:batch', { batch: batch.length, remaining: pendingPointFinalizations.length })
+        await finalizePendingPoints(batch)
+      }
+    } finally {
+      drainingPointFinalizations = false
+      if (pendingPointFinalizations.length) {
+        debugLog('points', 'drain:requeue', { queued: pendingPointFinalizations.length })
+        void drainPointFinalizations()
+      } else {
+        debugLog('points', 'drain:done')
+      }
     }
-  } finally {
-    drainingPointFinalizations = false
-    if (pendingPointFinalizations.length) {
-      debugLog('points', 'drain:requeue', { queued: pendingPointFinalizations.length })
-      void drainPointFinalizations()
-    } else {
-      debugLog('points', 'drain:done')
+  })()
+  return pointFinalizationDrain
+}
+
+async function awaitPointFinalizationIdle(): Promise<void> {
+  const deadline = Date.now() + POINT_CLICK_SETTLE_MAX_MS * 4
+  for (;;) {
+    if (pointFinalizationDrain) await pointFinalizationDrain
+    if (
+      !pendingPointFinalizations.length
+      && !drainingPointFinalizations
+      && !graphLoadQueue.isInFlight()
+      && !selectedPoints.some((point) => point.snappedNode < 0)
+    ) return
+    if (Date.now() >= deadline) {
+      debugLog('points', 'finalize:idle-timeout', { points: selectedPoints.length })
+      return
     }
+    if (pendingPointFinalizations.length) void drainPointFinalizations()
+    await new Promise((resolve) => window.setTimeout(resolve, POINT_CLICK_COALESCE_MS))
   }
 }
 
@@ -898,7 +920,12 @@ async function movePoint(id: string, location: LatLng): Promise<void> {
 
   const coverage = await ensureGraphCoversPoints()
   if (!coverage.ok) {
-    if (coverage.aborted) return
+    if (coverage.aborted) {
+      selectedPoints = previousPoints
+      renderer.setPoints(selectedPoints)
+      renderPointList()
+      return
+    }
     selectedPoints = previousPoints
     renderer.setPoints(selectedPoints)
     renderPointList()
@@ -973,17 +1000,22 @@ function renderPointList(): void {
   } else {
     if (!selectedPoints.some((point) => point.id === tspStartPointId)) tspStartPointId = selectedPoints[0]?.id
     summary.textContent = String(selectedPoints.length)
-    pointListEl.innerHTML = selectedPoints.map((point, index) => `
-    <div class="point-row">
+    pointListEl.innerHTML = selectedPoints.map((point, index) => {
+      const pending = point.snappedNode < 0
+      const snapLabel = pending ? 'pending…' : `${point.snapDistance.toFixed(1)} m snap`
+      const rowClass = pending ? 'point-row point-row-pending' : 'point-row'
+      return `
+    <div class="${rowClass}">
       <strong>${point.label}</strong>
-      <span>${point.snapDistance.toFixed(1)} m snap</span>
+      <span class="${pending ? 'snap-pending' : ''}">${snapLabel}</span>
       <button data-action="start" data-id="${point.id}" ${point.id === tspStartPointId ? 'disabled' : ''}>${point.id === tspStartPointId ? 'Start' : 'Set start'}</button>
       <button data-action="up" data-id="${point.id}" ${index === 0 ? 'disabled' : ''}>Up</button>
       <button data-action="down" data-id="${point.id}" ${index === selectedPoints.length - 1 ? 'disabled' : ''}>Down</button>
       <button data-action="move" data-id="${point.id}">Move</button>
       <button data-action="delete" data-id="${point.id}">Delete</button>
     </div>
-  `).join('')
+  `
+    }).join('')
   }
   updateOperationEstimates()
 }
@@ -1073,6 +1105,13 @@ function schedulePointFinalization(pointId: string, location: LatLng): void {
   void drainPointFinalizations()
 }
 
+function scheduleImportedPoints(locations: LatLng[]): void {
+  for (const location of locations) {
+    const provisional = addProvisionalPoint(location)
+    schedulePointFinalization(provisional.id, location)
+  }
+}
+
 function hasUnsettledPoints(): boolean {
   return graphLoadQueue.isInFlight()
     || pendingPointFinalizations.length > 0
@@ -1127,6 +1166,17 @@ function graphCoversPoints(locations: LatLng[]): boolean {
     }
   }
   return true
+}
+
+function graphSatisfiesPoints(locations: LatLng[]): boolean {
+  if (!graphCoversPoints(locations)) return false
+  if (!selectedPoints.length) return true
+  if (selectedPoints.some((point) => point.snappedNode < 0)) return false
+  return terminalsReachable()
+}
+
+function expansionMergeMode(): boolean {
+  return Boolean(graph?.edges.length)
 }
 
 function syncLastBoundsToPoints(padding: number): void {
@@ -1379,7 +1429,7 @@ async function loadElongatedCorridorGraph(
     const loaded = await loadGraph(region, [], work, {
       preserveSelectedPoints: true,
       internal: true,
-      merge: false,
+      merge: expansionMergeMode(),
       deferUi: true,
       timeoutMs: BULK_FETCH_TIMEOUT_MS,
       statusContext: 'trail corridor',
@@ -1448,7 +1498,7 @@ async function loadBboxForAllPoints(
     const loaded = await loadGraph(region, [], work, {
       preserveSelectedPoints: true,
       internal: true,
-      merge: false,
+      merge: expansionMergeMode(),
       deferUi: true,
       timeoutMs: BULK_FETCH_TIMEOUT_MS,
       statusContext: `${locations.length} points`,
@@ -1666,10 +1716,11 @@ async function loadSparsePointPatches(
 async function loadGraphForSelectedPoints(
   work: GraphLoadToken,
   padding: number,
+  options: { skipPlacementWait?: boolean } = {},
 ): Promise<boolean | 'aborted'> {
   if (!selectedPoints.length) return true
 
-  if (stillPlacingPoints()) {
+  if (!options.skipPlacementWait && !drainingPointFinalizations && stillPlacingPoints()) {
     await waitForDrainBatchReady()
   }
 
@@ -1681,7 +1732,7 @@ async function loadGraphForSelectedPoints(
     const loaded = await loadGraph(bounds, [], work, {
       preserveSelectedPoints: true,
       internal: true,
-      merge: false,
+      merge: expansionMergeMode(),
       timeoutMs: PATCH_FETCH_TIMEOUT_MS,
     })
     if (!loaded) return work.signal.aborted || !graphLoadQueue.isCurrent(work) ? 'aborted' : false
@@ -1711,6 +1762,14 @@ async function loadGraphForSelectedPoints(
   }
 
   const spanM = pointSetSpanMeters(locations)
+  if (shouldPreferPatchBridgeLoad(locations)) {
+    debugLog('expand', 'patch-bridge-first', { points: locations.length, spanM: Math.round(spanM) })
+    const patched = await loadPointPatchesAndBridge(work, padding)
+    refreshGraphDisplay()
+    if (patched === true || patched === 'aborted') return patched
+    debugLog('expand', 'patch-bridge-fallback-corridor', { points: locations.length })
+  }
+
   if (isElongatedPointSet(locations) && spanM > 600 && spanM <= ELONGATED_CORRIDOR_MAX_SPAN_METERS) {
     const corridor = await loadElongatedCorridorGraph(work, padding)
     refreshGraphDisplay()
@@ -1801,7 +1860,7 @@ async function runPointExpansion(work: GraphLoadToken): Promise<boolean | 'abort
       points: selectedPoints.length,
     })
 
-    const patchResult = await loadGraphForSelectedPoints(work, padding)
+    const patchResult = await loadGraphForSelectedPoints(work, padding, { skipPlacementWait: drainingPointFinalizations })
     if (patchResult === 'aborted') return 'aborted'
 
     const tspStartId = tspStartPointId
@@ -1828,17 +1887,23 @@ async function runPointExpansion(work: GraphLoadToken): Promise<boolean | 'abort
   return pointsAreRoutable()
 }
 
-async function ensureGraphCoversPoints(): Promise<PointCoverageResult> {
+async function ensureGraphCoversPoints(
+  options: { skipPlacementWait?: boolean } = {},
+): Promise<PointCoverageResult> {
   if (!selectedPoints.length) return { ok: graph !== undefined, reloaded: false }
 
   const uncovered = uncoveredPoints()
   const incrementalMove = canExpandIncrementally(uncovered)
-  if (!incrementalMove && stillPlacingPoints()) {
+  if (!options.skipPlacementWait && !incrementalMove && !drainingPointFinalizations && stillPlacingPoints()) {
     await waitForDrainBatchReady()
   }
 
   const locations = selectedPoints.map((point) => point.location)
-  const needsReload = !graphCoversPoints(locations)
+  const snapCovered = graphCoversPoints(locations)
+  const needsReload = !graphSatisfiesPoints(locations)
+  if (snapCovered && needsReload) {
+    debugLog('coverage', 'miss:disconnected', { points: locations.length })
+  }
   debugLog('coverage', 'ensure', { needsReload, points: locations.length })
   if (!needsReload) return { ok: true, reloaded: false }
   const expanded = await expandGraphForPoints()
@@ -1963,12 +2028,13 @@ function clearAlgorithmRerun(): void {
 function failPendingPointFinalizations(
   _pending: Array<{ id: string; location: LatLng }>,
   message: string,
+  preserveFatal = false,
 ): void {
   if (graph) refreshGraphDisplay()
   else renderer.setPoints(selectedPoints)
   renderPointList()
   graphLoadAbortRetries = 0
-  graphLoadFatalError = false
+  if (!preserveFatal) graphLoadFatalError = false
   setStatus(message, 'error')
 }
 
@@ -2289,6 +2355,8 @@ function updateOperationEstimates(): void {
 }
 
 function clearSelection(announce = true): void {
+  pendingPointFinalizations.length = 0
+  graphLoadAbortRetries = 0
   selectedPoints = []
   polygonPoints = []
   movingPointId = undefined
@@ -2421,11 +2489,12 @@ async function restoreFromUrl(): Promise<void> {
   if (bounds) {
     lastBounds = bounds
     await loadGraph(bounds)
-    for (const point of restoredPoints) addPoint(point)
+    scheduleImportedPoints(restoredPoints)
+    await awaitPointFinalizationIdle()
     const tspStartIndex = Number(params.get('tspStart') ?? 0)
     tspStartPointId = selectedPoints[tspStartIndex]?.id ?? selectedPoints[0]?.id
     renderPointList()
-    await rerunAfterSelectionEdit()
+    if (selectedPoints.length) await rerunAfterSelectionEdit()
   }
   updateAlgorithmInfo()
 }
@@ -2480,10 +2549,11 @@ async function loadExperiment(): Promise<void> {
     }
     lastBounds = experiment.bounds
     await loadGraph(experiment.bounds)
-    for (const point of experiment.points) addPoint(point)
+    scheduleImportedPoints(experiment.points)
+    await awaitPointFinalizationIdle()
     tspStartPointId = selectedPoints[experiment.tspStartIndex ?? 0]?.id ?? selectedPoints[0]?.id
     renderPointList()
-    await rerunAfterSelectionEdit()
+    if (selectedPoints.length) await rerunAfterSelectionEdit()
   }
   updateAlgorithmInfo()
   setStatus(`Loaded experiment "${experiment.name}".`, 'success')
@@ -2522,7 +2592,12 @@ async function importPoints(): Promise<void> {
   selectedPoints = []
   tspStartPointId = undefined
   renderer.setPoints(selectedPoints)
-  for (const point of points) addPoint(point)
+  scheduleImportedPoints(points)
+  await awaitPointFinalizationIdle()
+  if (!selectedPoints.some((point) => point.snappedNode >= 0)) {
+    setStatus('Imported points are outside the loaded graph.', 'error')
+    return
+  }
   await rerunAfterSelectionEdit()
   setStatus(`Imported ${points.length} points.`, 'success')
 }
